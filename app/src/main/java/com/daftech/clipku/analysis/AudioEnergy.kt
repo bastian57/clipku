@@ -19,11 +19,30 @@ import kotlin.math.sqrt
  * decode ke PCM via MediaExtractor + MediaCodec, hitung RMS per detik,
  * lalu HAPUS file cache. Audio TIDAK disimpan sebagai hasil akhir.
  *
- * Best-effort: kalau decode gagal (codec tidak didukung, stream rusak),
- * kembalikan map kosong — scoring tetap jalan dengan heatmap + transkrip.
- * Fungsi ini TIDAK pernah melempar ke UI.
+ * v1.0.3: hasil bukan lagi sekadar map kosong/berisi. AudioAnalysisResult
+ * membawa jejak tahapnya (HTTP, byte, mime, error decode, stream dicoba)
+ * supaya diagnostik UI bisa menyebut KENAPA audio 0 detik, bukan cuma
+ * "0 detik". Fungsi ini TIDAK pernah melempar ke UI.
  */
+data class AudioAnalysisResult(
+    val bySecond: Map<Int, Double>,
+    val httpCode: Int,
+    val downloadedBytes: Long,
+    val mime: String,
+    val error: String?,
+    val streamsTried: Int
+)
+
+private data class DecodeOutcome(
+    val bySecond: Map<Int, Double>,
+    val mime: String,
+    val error: String?
+)
+
 object AudioEnergy {
+    private const val BROWSER_UA =
+        "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
+
     suspend fun analyse(
         audioUrl: String?,
         cacheDir: File,
@@ -31,26 +50,108 @@ object AudioEnergy {
             .connectTimeout(20, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
             .build()
-    ): Map<Int, Double> = withContext(Dispatchers.IO) {
-        if (audioUrl.isNullOrEmpty()) return@withContext emptyMap()
-        val tmp = File(cacheDir, "clipku-audio-temp")
-        try {
-            val request = Request.Builder().url(audioUrl).build()
-            val response = http.newCall(request).execute()
-            if (!response.isSuccessful) return@withContext emptyMap()
-            tmp.outputStream().use { out ->
-                response.body?.byteStream()?.copyTo(out)
+    ): AudioAnalysisResult =
+        analyseMultiple(listOfNotNull(audioUrl), cacheDir, http)
+
+    /**
+     * Coba stream audio berurutan: yang pertama decode-nya kosong
+     * langsung dilanjutkan ke stream berikutnya, sampai satu berhasil
+     * atau daftar habis. Yang pertama berhasil langsung dipakai.
+     */
+    suspend fun analyseMultiple(
+        audioUrls: List<String>,
+        cacheDir: File,
+        http: OkHttpClient = OkHttpClient.Builder()
+            .connectTimeout(20, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
+            .build()
+    ): AudioAnalysisResult = withContext(Dispatchers.IO) {
+        val urls = audioUrls.filter { it.isNotEmpty() }.distinct()
+        if (urls.isEmpty()) {
+            return@withContext AudioAnalysisResult(
+                emptyMap(), 0, 0, "", "tanpa URL audio", 0
+            )
+        }
+        var tried = 0
+        var last = AudioAnalysisResult(emptyMap(), 0, 0, "", "tanpa URL audio", 0)
+        for (url in urls) {
+            tried++
+            val result = analyseOne(url, cacheDir, http)
+            if (result.bySecond.isNotEmpty()) {
+                return@withContext result.copy(streamsTried = tried)
             }
+            last = result
+        }
+        last.copy(streamsTried = tried)
+    }
+
+    private suspend fun analyseOne(
+        audioUrl: String,
+        cacheDir: File,
+        http: OkHttpClient
+    ): AudioAnalysisResult = withContext(Dispatchers.IO) {
+        var tmp: File? = null
+        try {
+            val request = Request.Builder()
+                .url(audioUrl)
+                .header("User-Agent", BROWSER_UA)
+                .header("Referer", "https://www.youtube.com/")
+                .build()
+            val response = http.newCall(request).execute()
+            if (!response.isSuccessful) {
+                val code = response.code
+                response.close()
+                return@withContext AudioAnalysisResult(
+                    emptyMap(), code, 0, "", "HTTP $code", 0
+                )
+            }
+            // Ekstensi dari Content-Type, sebelum body ditulis, supaya
+            // MediaExtractor lebih mudah mengenali formatnya.
+            val contentType = response.header("Content-Type", "") ?: ""
+            val ext = when {
+                contentType.contains("mp4") -> ".m4a"
+                contentType.contains("webm") -> ".webm"
+                contentType.contains("mpeg") || contentType.contains("mp3") -> ".mp3"
+                contentType.contains("ogg") || contentType.contains("opus") -> ".ogg"
+                else -> ""
+            }
+            tmp = File(cacheDir, "clipku-audio-temp$ext")
+            var bytes = 0L
+            tmp.outputStream().use { out ->
+                val stream = response.body?.byteStream()
+                if (stream != null) {
+                    val buffer = ByteArray(8192)
+                    while (true) {
+                        val read = stream.read(buffer)
+                        if (read < 0) break
+                        out.write(buffer, 0, read)
+                        bytes += read
+                    }
+                }
+            }
+            val code = response.code
             response.close()
-            decodeRmsPerSecond(tmp)
+            if (bytes <= 0L) {
+                return@withContext AudioAnalysisResult(
+                    emptyMap(), code, 0, contentType, "0 byte terunduh", 0
+                )
+            }
+            val outcome = decodeRmsPerSecond(tmp)
+            AudioAnalysisResult(
+                outcome.bySecond, code, bytes, outcome.mime,
+                outcome.error, 0
+            )
         } catch (e: Exception) {
-            emptyMap()
+            AudioAnalysisResult(
+                emptyMap(), 0, 0, "",
+                (e.message ?: "gagal unduh/decode").take(80), 0
+            )
         } finally {
-            try { tmp.delete() } catch (e: Exception) { /* abaikan */ }
+            try { tmp?.delete() } catch (e: Exception) { /* abaikan */ }
         }
     }
 
-    private fun decodeRmsPerSecond(file: File): Map<Int, Double> {
+    private fun decodeRmsPerSecond(file: File): DecodeOutcome {
         val extractor = MediaExtractor()
         try {
             extractor.setDataSource(file.absolutePath)
@@ -65,13 +166,14 @@ object AudioEnergy {
                     break
                 }
             }
-            if (trackIndex < 0 || format == null) return emptyMap()
+            if (trackIndex < 0 || format == null) {
+                return DecodeOutcome(emptyMap(), "", "tanpa track audio")
+            }
+            val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
             extractor.selectTrack(trackIndex)
             val sampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
             val channelCount = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
-            val codec = MediaCodec.createDecoderByType(
-                format.getString(MediaFormat.KEY_MIME) ?: return emptyMap()
-            )
+            val codec = MediaCodec.createDecoderByType(mime)
             codec.configure(format, null, null, 0)
             codec.start()
             val sumSquares = mutableMapOf<Int, Double>()
@@ -120,7 +222,9 @@ object AudioEnergy {
             }
             codec.stop()
             codec.release()
-            if (sumSquares.isEmpty()) return emptyMap()
+            if (sumSquares.isEmpty()) {
+                return DecodeOutcome(emptyMap(), mime, "decode 0 sampel")
+            }
             var maxRms = 0.0
             val rmsBySecond = mutableMapOf<Int, Double>()
             for ((second, sum) in sumSquares) {
@@ -129,10 +233,17 @@ object AudioEnergy {
                 rmsBySecond[second] = rms
                 if (rms > maxRms) maxRms = rms
             }
-            if (maxRms <= 0.0) return emptyMap()
-            return rmsBySecond.mapValues { (_, rms) -> (rms / maxRms).coerceIn(0.0, 1.0) }
+            if (maxRms <= 0.0) {
+                return DecodeOutcome(emptyMap(), mime, "audio senyap (RMS 0)")
+            }
+            return DecodeOutcome(
+                rmsBySecond.mapValues { (_, rms) -> (rms / maxRms).coerceIn(0.0, 1.0) },
+                mime, null
+            )
         } catch (e: Exception) {
-            return emptyMap()
+            return DecodeOutcome(
+                emptyMap(), "", (e.message ?: "gagal decode").take(80)
+            )
         } finally {
             try { extractor.release() } catch (e: Exception) { /* abaikan */ }
         }

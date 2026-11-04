@@ -164,6 +164,8 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                 // Innertube tetap dipakai, bukan crash.
                 var streamSource = innertube.lastStreamSource
                 var subtitlesFromNewPipe = false
+                // v1.0.3: daftar URL audio untuk fallback berurutan.
+                var audioUrls: List<String> = listOfNotNull(info.stream.audioUrl)
                 status = "Mencari stream via NewPipe…"
                 try {
                     val newPipe = NewPipeStreamExtractor.extract(videoId)
@@ -177,7 +179,12 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                                 mimeProgressive = info.stream.mimeProgressive
                             )
                         )
-                        if (newPipe.audioUrl != null) streamSource = "NEWPIPE"
+                        if (newPipe.audioUrl != null) {
+                            streamSource = "NEWPIPE"
+                            audioUrls = newPipe.audioUrls.ifEmpty {
+                                listOfNotNull(newPipe.audioUrl)
+                            }
+                        }
                         if (info.captionTracks.isEmpty() && newPipe.subtitles.isNotEmpty()) {
                             info = info.copy(captionTracks = newPipe.subtitles)
                             subtitlesFromNewPipe = true
@@ -185,6 +192,9 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                     }
                 } catch (e: Exception) {
                     // NewPipe gagal = lanjut dengan Innertube apa adanya.
+                }
+                if (audioUrls.isEmpty()) {
+                    audioUrls = listOfNotNull(info.stream.audioUrl)
                 }
                 currentInfo = info
                 videoTitle = info.title
@@ -201,10 +211,13 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                     transcriptSource = "NEWPIPE"
                 }
                 status = "Menganalisa audio…"
-                val audio = AudioEnergy.analyse(
-                    info.stream.audioUrl,
+                // v1.0.3: coba stream audio berurutan + bawa jejak tahapnya.
+                val audioResult = AudioEnergy.analyseMultiple(
+                    audioUrls,
                     getApplication<Application>().cacheDir
                 )
+                val audio = audioResult.bySecond
+                val tracksTried = innertube.lastTracksTried
                 val segments = Scoring.buildSegments(sentences)
 
                 var llmScores: Map<Int, GroqClient.SegmentScore> = emptyMap()
@@ -255,13 +268,24 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                 } else {
                     ""
                 }
+                // v1.0.3: jejak tahap audio + transkrip, bukan cuma angka akhir.
+                val audioErrorText = if (audioResult.error != null) {
+                    " • audio error: " + audioResult.error
+                } else {
+                    ""
+                }
                 diagnostic = "Diagnostik: judul terambil • durasi " +
                     durationMinutes + " menit • track caption: " +
                     info.captionTracks.size + " • transkrip: " +
-                    sentences.size + " kalimat (sumber: " + transcriptSource + ") • " +
+                    sentences.size + " kalimat (sumber: " + transcriptSource +
+                    ", track dicoba: " + tracksTried + ") • " +
                     "heatmap: " + info.heatPoints.size + " titik • audio: URL " +
                     audioUrlText + ", " + audio.size + " detik ter-decode • " +
-                    "sumber stream: " + streamSource + " • Groq key: " +
+                    "sumber stream: " + streamSource + " • audio HTTP: " +
+                    audioResult.httpCode + " • audio byte: " +
+                    audioResult.downloadedBytes + " • audio mime: " +
+                    audioResult.mime.ifEmpty { "-" } + " • stream dicoba: " +
+                    audioResult.streamsTried + audioErrorText + " • Groq key: " +
                     groqKeyText + " • skor LLM: " + llmScores.size + " segmen" + zeroText
                 if (found.isEmpty()) {
                     error = "Tidak ada sinyal highlight yang cukup: video ini " +

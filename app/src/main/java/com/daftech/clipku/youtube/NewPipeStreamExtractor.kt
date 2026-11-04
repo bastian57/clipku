@@ -45,7 +45,10 @@ import java.util.concurrent.TimeUnit
 data class NewPipeStreamResult(
     val audioUrl: String?,
     val videoUrl: String?,
-    val subtitles: List<CaptionTrack>
+    val subtitles: List<CaptionTrack>,
+    // v1.0.3: semua URL audio, mp4 dulu lalu sisanya, tanpa duplikat.
+    // audioUrl di atas tetap = elemen pertama daftar ini (kompatibilitas).
+    val audioUrls: List<String> = emptyList()
 )
 
 object NewPipeStreamExtractor {
@@ -70,7 +73,8 @@ object NewPipeStreamExtractor {
             val url = "https://www.youtube.com/watch?v=$videoId"
             val extractor: StreamExtractor = ServiceList.YouTube.getStreamExtractor(url)
             extractor.fetchPage()
-            val audio = pickAudio(extractor.audioStreams)
+            val audioList = pickAudioUrls(extractor.audioStreams)
+            val audio = audioList.firstOrNull()
             val video = pickVideo(
                 (extractor.videoStreams ?: emptyList()) +
                     (extractor.videoOnlyStreams ?: emptyList())
@@ -82,24 +86,27 @@ object NewPipeStreamExtractor {
             } catch (e: Exception) {
                 emptyList()
             }
-            NewPipeStreamResult(audio, video, subtitles)
+            NewPipeStreamResult(audio, video, subtitles, audioList)
         } catch (e: Exception) {
             NewPipeStreamResult(null, null, emptyList())
         }
     }
 
-    private fun pickAudio(streams: List<AudioStream>?): String? {
-        if (streams.isNullOrEmpty()) return null
-        val withUrl = streams.filter { !it.url.isNullOrEmpty() }
-        if (withUrl.isEmpty()) return null
-        val mp4 = withUrl.firstOrNull { stream ->
-            try {
-                stream.format?.mimeType?.contains("mp4") == true
-            } catch (e: Exception) {
-                false
+    /** URL audio berurutan: mp4 dulu, lalu sisanya, tanpa duplikat. */
+    private fun pickAudioUrls(streams: List<AudioStream>?): List<String> {
+        if (streams.isNullOrEmpty()) return emptyList()
+        val withUrl = streams.mapNotNull { it.url }.filter { it.isNotEmpty() }.distinct()
+        if (withUrl.isEmpty()) return emptyList()
+        val mp4 = withUrl.filter { url ->
+            streams.any { stream ->
+                stream.url == url && try {
+                    stream.format?.mimeType?.contains("mp4") == true
+                } catch (e: Exception) {
+                    false
+                }
             }
         }
-        return (mp4 ?: withUrl.first()).url
+        return (mp4 + withUrl.filter { it !in mp4 }).distinct()
     }
 
     private fun pickVideo(streams: List<VideoStream>): String? {
