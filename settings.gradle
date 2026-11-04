@@ -10,8 +10,10 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
-        // Sengaja TANPA JitPack: NewPipeExtractor tidak dibundel di v1
-        // (lihat BUILD-NOTES.md). Sumber stream utama = Innertube via OkHttp.
+        // v1.0.2: JitPack DITAMBAHKAN karena NewPipeExtractor hanya
+        // didistribusikan lewat JitPack (tidak ada di Maven Central).
+        // v1 sengaja tanpa JitPack karena NewPipe belum dibundel.
+        maven { url = uri("https://jitpack.io") }
     }
 }
 rootProject.name = "ClipKu"

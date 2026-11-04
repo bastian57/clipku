@@ -224,8 +224,11 @@ private fun ClipCard(
                 // BLOK NARASI FINAL — satu-satunya yang disalin tombol Salin.
                 Text(text = narration, style = MaterialTheme.typography.bodyMedium)
                 // Metadata narasi di luar blok: tidak ikut tersalin.
+                // Termasuk sumber transkrip ("Transkrip"/"Whisper") —
+                // label ini hanya info UI, bukan bagian teks yang disalin.
+                val sourceText = clip.narrationSource?.let { "sumber: $it • " } ?: ""
                 Text(
-                    text = "${clip.narrationWordCount} kata • " +
+                    text = sourceText + "${clip.narrationWordCount} kata • " +
                         "±${Narration.estimatedSeconds(narration)} detik • " +
                         "untuk generate di SuaraKu",
                     style = MaterialTheme.typography.bodySmall

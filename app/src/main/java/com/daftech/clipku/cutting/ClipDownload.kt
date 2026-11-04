@@ -109,6 +109,60 @@ object ClipDownload {
         saveToDownloads(context, cutFile, fileName)
     }
 
+    /**
+     * Potong SATU clip ke file temp di cache (v1.0.2, untuk Whisper).
+     * Sama seperti downloadClip, tapi TIDAK menyalin hasil ke
+     * Downloads/ClipKu dan TIDAK mengembalikan path tampil — yang
+     * dikembalikan adalah file temp itu sendiri, dan PEMANGGIL wajib
+     * menghapusnya di blok finally setelah dipakai (Whisper selesai).
+     * Mengembalikan null kalau tidak ada stream yang bisa dipotong
+     * atau pemotongan gagal. File sumber cache dipakai ulang dari
+     * sesi yang sama persis seperti downloadClip, jadi Whisper untuk
+     * clip kedua dari video yang sama tidak mengunduh ulang sumber.
+     * Trade-off yang dicatat di FIX-NOTES: Whisper pertama untuk satu
+     * video bisa mengunduh sumber penuh (biaya yang sama seperti satu
+     * tap Download), tapi yang dikirim ke Whisper tetap hanya file
+     * clip ~60 detik ini, bukan video utuh.
+     */
+    suspend fun cutClipToTemp(
+        context: Context,
+        info: VideoInfo,
+        clip: Clip
+    ): File? = withContext(Dispatchers.IO) {
+        val cacheDir = File(context.cacheDir, "clipku-source").apply { mkdirs() }
+        val temp = File(context.cacheDir, "clipku-whisper-${info.videoId}-${clip.index}.mp4")
+        if (temp.exists()) temp.delete()
+        val ok = if (info.stream.progressiveUrl != null) {
+            val source = File(cacheDir, "source-${info.videoId}.mp4")
+            if (!source.exists() || source.length() == 0L) {
+                if (!downloadToFile(info.stream.progressiveUrl, source)) {
+                    return@withContext null
+                }
+            }
+            CuttingEngine.cutProgressive(context, source, clip.startMs, clip.endMs, temp)
+        } else if (info.stream.videoOnlyUrl != null && info.stream.audioUrl != null) {
+            val videoFile = File(cacheDir, "source-${info.videoId}-video.mp4")
+            val audioFile = File(cacheDir, "source-${info.videoId}-audio")
+            if (!videoFile.exists() || videoFile.length() == 0L) {
+                if (!downloadToFile(info.stream.videoOnlyUrl, videoFile)) {
+                    return@withContext null
+                }
+            }
+            if (!audioFile.exists() || audioFile.length() == 0L) {
+                if (!downloadToFile(info.stream.audioUrl, audioFile)) {
+                    return@withContext null
+                }
+            }
+            CuttingEngine.cutAdaptive(videoFile, audioFile, clip.startMs, clip.endMs, temp)
+        } else {
+            false
+        }
+        if (ok && temp.exists() && temp.length() > 0) temp else {
+            try { temp.delete() } catch (e: Exception) { /* abaikan */ }
+            null
+        }
+    }
+
     private fun saveToDownloads(context: Context, cutFile: File, fileName: String): String {
         // Jalur utama: MediaStore Downloads/ClipKu (API 29+, tanpa izin storage).
         try {

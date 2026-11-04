@@ -58,6 +58,13 @@ data class Clip(
     val savedPath: String? = null,
     /** Teks narasi final, null kalau belum dibuat. */
     val narration: String? = null,
+    /**
+     * Sumber transkrip yang dipakai narasi ("Transkrip" atau "Whisper"),
+     * null kalau narasi belum dibuat. Ini METADATA UI di luar blok
+     * narasi — TIDAK PERNAH ikut tersalin tombol Salin, yang hanya
+     * menyalin [narration].
+     */
+    val narrationSource: String? = null,
     val narrationWordCount: Int = 0,
     val narrationError: String? = null,
     val isDownloading: Boolean = false,

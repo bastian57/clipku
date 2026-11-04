@@ -62,9 +62,22 @@ class InnertubeClient(
     /** Cache respons ANDROID dari merge stream, dipakai ulang oleh fallback transkrip. */
     private var cachedAndroidInfo: VideoInfo? = null
 
+    /**
+     * Sumber stream Innertube terakhir yang berhasil dipakai fetchVideoInfo:
+     * "WEB", "WEB+ANDROID" (ANDROID mengisi yang kosong dari WEB), atau
+     * "NONE". Dibaca ViewModel untuk diagnostik. NewPipe TIDAK mengubah
+     * nilai ini — sumber NEWPIPE dicatat terpisah di ViewModel, karena
+     * NewPipe di-merge SETELAH fetchVideoInfo selesai.
+     */
+    var lastStreamSource: String = "NONE"
+        private set
+
     suspend fun fetchVideoInfo(videoId: String): VideoInfo = withContext(Dispatchers.IO) {
         val webRoot = fetchPlayer(videoId, "WEB", "2.20240111.09.00")
         var info = parseVideoInfo(videoId, webRoot)
+        val webAudio = info.stream.audioUrl
+        val webProgressive = info.stream.progressiveUrl
+        lastStreamSource = if (webAudio != null || webProgressive != null) "WEB" else "NONE"
         // v1.0.1: fallback stream ANDROID, hanya kalau WEB kekurangan stream.
         // Format ANDROID sering berupa URL langsung, sedangkan format WEB
         // sering hanya signatureCipher (yang tidak dibaca / tidak di-decipher
@@ -74,6 +87,11 @@ class InnertubeClient(
                 val androidInfo = fetchAndroidVideoInfo(videoId)
                 if (androidInfo != null) {
                     cachedAndroidInfo = androidInfo
+                    if ((webAudio == null && androidInfo.stream.audioUrl != null) ||
+                        (webProgressive == null && androidInfo.stream.progressiveUrl != null)
+                    ) {
+                        lastStreamSource = "WEB+ANDROID"
+                    }
                     val mergedStream = VideoStream(
                         progressiveUrl = info.stream.progressiveUrl
                             ?: androidInfo.stream.progressiveUrl,
@@ -323,7 +341,15 @@ class InnertubeClient(
             ?: tracks.firstOrNull()
             ?: return@withContext emptyList()
         try {
-            val url = track.baseUrl + "&fmt=vtt"
+            // v1.0.2: track NewPipe sudah membawa fmt sendiri di URL-nya
+            // (mis. fmt=vtt atau format lain) — jangan menumpuk "&fmt=vtt"
+            // di belakangnya. Track Innertube yang belum ber-fmt tetap
+            // ditambah "&fmt=vtt" seperti sebelumnya.
+            val url = if (track.baseUrl.contains("fmt=")) {
+                track.baseUrl
+            } else {
+                track.baseUrl + "&fmt=vtt"
+            }
             val request = Request.Builder()
                 .url(url)
                 .header("User-Agent", BROWSER_UA)

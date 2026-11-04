@@ -11,8 +11,8 @@ android {
         applicationId 'com.daftech.clipku'
         minSdk 24
         targetSdk 34
-        versionCode 2
-        versionName '1.0.1'
+        versionCode 3
+        versionName '1.0.2'
         testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
         vectorDrawables { useSupportLibrary = true }
         ndk {
@@ -80,6 +80,17 @@ dependencies {
     // HTTP Innertube + Groq. org.json bawaan Android dipakai untuk JSON
     // (tanpa Gson/Moshi, supaya dependensi tetap sedikit).
     implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+
+    // v1.0.2: NewPipeExtractor via JitPack — mesin stream utama yang
+    // men-decipher signature YouTube (Innertube WEB/ANDROID sering
+    // hanya mengembalikan signatureCipher). Versi v0.26.4 = tag rilis
+    // TeamNewPipe yang terverifikasi saat build ini ditulis; JitPack
+    // adalah satu-satunya jalur distribusi resmi NewPipeExtractor
+    // (tidak ada di Maven Central) — kalau JitPack gagal build tag ini
+    // di Actions, itulah titik merah pertama yang harus diperiksa.
+    // Lisensi GPL-3.0: source ClipKu sudah publik di GitHub, pemakaian
+    // pribadi aman; evaluasi ulang kalau suatu hari dijual tertutup.
+    implementation 'com.github.teamnewpipe:NewPipeExtractor:v0.26.4'
 
     debugImplementation 'androidx.compose.ui:ui-tooling'
     debugImplementation 'androidx.compose.ui:ui-test-manifest'

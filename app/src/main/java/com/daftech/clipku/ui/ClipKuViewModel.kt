@@ -17,9 +17,12 @@ import com.daftech.clipku.analysis.GroqClient
 import com.daftech.clipku.analysis.Narration
 import com.daftech.clipku.analysis.Scoring
 import com.daftech.clipku.cutting.ClipDownload
+import com.daftech.clipku.groq.WhisperClient
 import com.daftech.clipku.model.Clip
 import com.daftech.clipku.model.VideoInfo
+import com.daftech.clipku.model.VideoStream
 import com.daftech.clipku.youtube.InnertubeClient
+import com.daftech.clipku.youtube.NewPipeStreamExtractor
 import com.daftech.clipku.youtube.VideoId
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -37,6 +40,7 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
     private val prefs = Prefs(application)
     private val innertube = InnertubeClient()
     private val groq = GroqClient()
+    private val whisper = WhisperClient()
 
     var link by mutableStateOf("")
         private set
@@ -148,16 +152,54 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
         status = "Menghubungi YouTube…"
         viewModelScope.launch {
             try {
-                val info = innertube.fetchVideoInfo(videoId)
+                var info = innertube.fetchVideoInfo(videoId)
+                // v1.0.2: NewPipe DULUAN untuk stream (decipher signature).
+                // Innertube tetap dipakai untuk judul/durasi/caption/heatmap.
+                // NewPipe menang hanya untuk yang diberikannya: audioUrl
+                // dan videoUrl (sebagai videoOnlyUrl, BUKAN progressive —
+                // stream video NewPipe umumnya video-only, dan menandainya
+                // progressive akan membuat download memotong tanpa audio).
+                // Subtitle NewPipe hanya dipakai kalau Innertube tidak
+                // punya caption sama sekali. Gagal NewPipe = hasil kosong,
+                // Innertube tetap dipakai, bukan crash.
+                var streamSource = innertube.lastStreamSource
+                var subtitlesFromNewPipe = false
+                status = "Mencari stream via NewPipe…"
+                try {
+                    val newPipe = NewPipeStreamExtractor.extract(videoId)
+                    if (newPipe.audioUrl != null || newPipe.videoUrl != null) {
+                        info = info.copy(
+                            stream = VideoStream(
+                                progressiveUrl = info.stream.progressiveUrl,
+                                videoOnlyUrl = newPipe.videoUrl
+                                    ?: info.stream.videoOnlyUrl,
+                                audioUrl = newPipe.audioUrl ?: info.stream.audioUrl,
+                                mimeProgressive = info.stream.mimeProgressive
+                            )
+                        )
+                        if (newPipe.audioUrl != null) streamSource = "NEWPIPE"
+                        if (info.captionTracks.isEmpty() && newPipe.subtitles.isNotEmpty()) {
+                            info = info.copy(captionTracks = newPipe.subtitles)
+                            subtitlesFromNewPipe = true
+                        }
+                    }
+                } catch (e: Exception) {
+                    // NewPipe gagal = lanjut dengan Innertube apa adanya.
+                }
                 currentInfo = info
                 videoTitle = info.title
                 videoAuthor = info.author
                 status = "Mengambil transkrip…"
                 // v1.0.1: rantai fallback WEB -> TIMEDTEXT -> ANDROID.
                 // Sumbernya dicatat untuk diagnostik, bukan disembunyikan.
+                // v1.0.2: kalau track yang dipakai langkah pertama ternyata
+                // subtitle NewPipe, labelnya dikoreksi menjadi NEWPIPE.
                 val transcriptResult = innertube.fetchTranscriptWithFallback(info)
                 val sentences = transcriptResult.sentences
-                val transcriptSource = transcriptResult.source
+                var transcriptSource = transcriptResult.source
+                if (subtitlesFromNewPipe && transcriptSource == "WEB") {
+                    transcriptSource = "NEWPIPE"
+                }
                 status = "Menganalisa audio…"
                 val audio = AudioEnergy.analyse(
                     info.stream.audioUrl,
@@ -218,7 +260,8 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                     info.captionTracks.size + " • transkrip: " +
                     sentences.size + " kalimat (sumber: " + transcriptSource + ") • " +
                     "heatmap: " + info.heatPoints.size + " titik • audio: URL " +
-                    audioUrlText + ", " + audio.size + " detik ter-decode • Groq key: " +
+                    audioUrlText + ", " + audio.size + " detik ter-decode • " +
+                    "sumber stream: " + streamSource + " • Groq key: " +
                     groqKeyText + " • skor LLM: " + llmScores.size + " segmen" + zeroText
                 if (found.isEmpty()) {
                     error = "Tidak ada sinyal highlight yang cukup: video ini " +
@@ -232,7 +275,10 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                     } else ""
                     status = "Ditemukan ${found.size} clip highlight$heatNote."
                     if (sentences.isEmpty()) {
-                        status += " Transkrip tidak tersedia, jadi narasi per clip tidak bisa dibuat."
+                        // v1.0.2: tanpa transkrip video, narasi MASIH bisa
+                        // dibuat per clip lewat Whisper (bukan dari judul).
+                        status += " Transkrip video tidak tersedia — tap " +
+                            "Buat Narasi untuk transkrip clip via Whisper."
                     }
                 }
             } catch (e: Exception) {
@@ -274,9 +320,20 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
 
     /**
      * Buat narasi final per clip, on-demand.
-     * Menolak kalau: tidak ada Groq key, atau clip tidak ada transkrip.
+     * Menolak kalau: tidak ada Groq key, atau tidak ada teks apa pun
+     * yang bisa dipakai sebagai dasar narasi.
+     * Dua jalur teks dasar (keduanya BUKAN judul saja):
+     *  1. Transkrip video yang sudah ada di clip (jalur v1).
+     *  2. v1.0.2 Whisper: kalau clip tidak punya transkrip, potong
+     *     clip itu saja (~60 detik) ke file temp, kirim file temp itu
+     *     ke Groq Whisper, HAPUS file temp, lalu pakai transkrip
+     *     Whisper sebagai dasar narasi LLM. Video utuh TIDAK PERNAH
+     *     dikirim ke Whisper.
+     * Kalau Whisper gagal / tidak menemukan ucapan, narasi ditolak
+     * jujur, tapi clip-nya tetap tersedia untuk download dan edit.
      * Teks yang disimpan adalah teks BERSIH hasil Narration.clean —
-     * tombol Salin menyalin teks itu saja, bukan metadata.
+     * tombol Salin menyalin teks itu saja, bukan metadata; label
+     * sumber ("Transkrip"/"Whisper") hanya metadata UI di luar blok.
      */
     fun generateNarrationFor(clip: Clip) {
         val key = prefs.groqApiKey.trim()
@@ -286,26 +343,47 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
             }
             return
         }
-        if (clip.transcript.isBlank()) {
-            updateClip(clip.index) {
-                it.copy(
-                    narrationError = "Narasi tidak bisa dibuat: clip ini " +
-                        "tidak ada transkrip. Narasi tidak dibuat dari judul saja."
-                )
-            }
-            return
-        }
         viewModelScope.launch {
             updateClip(clip.index) {
                 it.copy(isGeneratingNarration = true, narrationError = null)
             }
             try {
-                var raw = groq.generateNarration(key, videoTitle, clip.transcript)
+                val transcriptText: String
+                val transcriptSource: String
+                if (clip.transcript.isNotBlank()) {
+                    transcriptText = clip.transcript
+                    transcriptSource = "Transkrip"
+                } else {
+                    val info = currentInfo
+                        ?: throw IllegalStateException(
+                            "Analisa dulu sebelum membuat narasi."
+                        )
+                    val temp = withContext(Dispatchers.IO) {
+                        ClipDownload.cutClipToTemp(getApplication(), info, clip)
+                    } ?: throw IllegalStateException(
+                        "Gagal memotong clip untuk transkrip Whisper. " +
+                            "Coba download clip dulu, atau coba lagi."
+                    )
+                    try {
+                        val whisperText = whisper.transcribe(key, temp)
+                        if (whisperText.isBlank()) {
+                            throw IllegalStateException(
+                                "Whisper tidak menemukan ucapan di clip " +
+                                    "ini, jadi narasi tidak dibuat dari tebakan."
+                            )
+                        }
+                        transcriptText = whisperText
+                        transcriptSource = "Whisper"
+                    } finally {
+                        try { temp.delete() } catch (e: Exception) { /* abaikan */ }
+                    }
+                }
+                var raw = groq.generateNarration(key, videoTitle, transcriptText)
                 var cleaned = Narration.clean(raw)
                 // Satu kali percobaan ulang kalau di luar 110-140 kata.
                 if (!Narration.isInTargetRange(cleaned)) {
                     try {
-                        raw = groq.generateNarration(key, videoTitle, clip.transcript)
+                        raw = groq.generateNarration(key, videoTitle, transcriptText)
                         val second = Narration.clean(raw)
                         if (Narration.isInTargetRange(second)) cleaned = second
                     } catch (e: Exception) {
@@ -317,7 +395,8 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                     it.copy(
                         isGeneratingNarration = false,
                         narration = cleaned,
-                        narrationWordCount = count
+                        narrationWordCount = count,
+                        narrationSource = transcriptSource
                     )
                 }
             } catch (e: Exception) {

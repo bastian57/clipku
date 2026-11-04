@@ -78,6 +78,21 @@ object Scoring {
         return out
     }
 
+    /**
+     * v1.0.2 JALUR AUDIO-ONLY (aturan, bukan perubahan logika baru):
+     * Kalau transkrip kosong DAN heatmap kosong TAPI energi audio ada,
+     * clip TETAP dibuat dari puncak audio saja. Ini sudah cara kerja
+     * kode di bawah dan sengaja TIDAK diubah di v1.0.2: bobot yang
+     * kosong menjadi 0, bobot yang tersisa dinormalisasi ulang
+     * (audio 0.20 -> 1.0), puncak diambil dari skor audio yang
+     * dihaluskan 15 detik, dan snapToSentences punya fallback untuk
+     * kalimat kosong (puncak - 30 detik sampai + 60 detik, dijepit
+     * durasi video). Yang BARU di v1.0.2 adalah audio itu sendiri
+     * kini bisa didapat lewat NewPipe untuk video yang stream
+     * Innertube-nya cipher-only — sebelumnya jalur ini mati karena
+     * audioUrl-nya null. Kalau audio JUGA kosong, tetap kembali
+     * emptyList (tolak jujur, bukan clip dari detik 0 atau dari sunyi).
+     */
     fun selectClips(input: AnalysisInput, videoTitle: String): List<Clip> {
         val durationSec = max(1, (input.durationMs / 1000).toInt())
         val heatPerSecond = heatPerSecond(input.heatPoints, input.durationMs)
