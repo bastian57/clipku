@@ -10,7 +10,6 @@ import okhttp3.RequestBody;
 import org.schabi.newpipe.extractor.downloader.Downloader;
 import org.schabi.newpipe.extractor.downloader.Request;
 import org.schabi.newpipe.extractor.downloader.Response;
-import org.schabi.newpipe.extractor.exceptions.ExtractionException;
 
 /**
  * Adaptor Downloader NewPipeExtractor di atas OkHttp yang sudah dipakai
@@ -38,7 +37,12 @@ public class OkHttpNewPipeDownloader extends Downloader {
     }
 
     @Override
-    public Response execute(Request request) throws IOException, ExtractionException {
+    // v1.0.2-fix: Downloader.execute di NewPipeExtractor 0.26.4 TIDAK
+    // mendeklarasikan ExtractionException (hanya IOException), jadi
+    // deklarasi itu dihapus — kalau tidak, javac menolak override-nya.
+    // Juga: OkHttp Response di Java diakses lewat method (), bukan
+    // property gaya Kotlin (body/code/message/headers/request).
+    public Response execute(Request request) throws IOException {
         byte[] data = request.dataToSend();
         RequestBody body = null;
         if (data != null) {
@@ -66,13 +70,13 @@ public class OkHttpNewPipeDownloader extends Downloader {
             builder.method(method, null);
         }
         try (okhttp3.Response response = client.newCall(builder.build()).execute()) {
-            String responseBody = response.body != null ? response.body.string() : "";
+            String responseBody = response.body() != null ? response.body().string() : "";
             return new Response(
-                    response.code,
-                    response.message,
-                    response.headers.toMultimap(),
+                    response.code(),
+                    response.message(),
+                    response.headers().toMultimap(),
                     responseBody,
-                    response.request.url.toString()
+                    response.request().url().toString()
             );
         }
     }
