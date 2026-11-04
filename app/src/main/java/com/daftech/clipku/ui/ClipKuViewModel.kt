@@ -44,6 +44,8 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
         private set
     var status by mutableStateOf("")
         private set
+    var diagnostic by mutableStateOf("")
+        private set
     var error by mutableStateOf<String?>(null)
         private set
     var videoTitle by mutableStateOf("")
@@ -140,6 +142,7 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
         if (isAnalysing) return
         isAnalysing = true
         error = null
+        diagnostic = ""
         clips = emptyList()
         currentInfo = null
         status = "Menghubungi YouTube…"
@@ -150,7 +153,11 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                 videoTitle = info.title
                 videoAuthor = info.author
                 status = "Mengambil transkrip…"
-                val sentences = innertube.fetchTranscript(info)
+                // v1.0.1: rantai fallback WEB -> TIMEDTEXT -> ANDROID.
+                // Sumbernya dicatat untuk diagnostik, bukan disembunyikan.
+                val transcriptResult = innertube.fetchTranscriptWithFallback(info)
+                val sentences = transcriptResult.sentences
+                val transcriptSource = transcriptResult.source
                 status = "Menganalisa audio…"
                 val audio = AudioEnergy.analyse(
                     info.stream.audioUrl,
@@ -190,6 +197,29 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                     ),
                     info.title
                 )
+                // v1.0.1 DIAGNOSTIK: angka nyata per sinyal, sukses maupun
+                // gagal, supaya kegagalan berikutnya langsung ketahuan
+                // sinyal mana yang nol dan kenapa (bukan pesan generik).
+                val durationMinutes = info.durationMs / 60_000
+                val zeroSignals = mutableListOf<String>()
+                if (info.heatPoints.isEmpty()) zeroSignals.add("heatmap")
+                if (sentences.isEmpty()) zeroSignals.add("transkrip")
+                if (audio.isEmpty()) zeroSignals.add("audio")
+                if (key.isBlank()) zeroSignals.add("Groq key")
+                val audioUrlText = if (info.stream.audioUrl != null) "ada" else "tidak ada"
+                val groqKeyText = if (key.isNotBlank()) "ada" else "tidak ada"
+                val zeroText = if (zeroSignals.isNotEmpty()) {
+                    " • sinyal nol: " + zeroSignals.joinToString(", ")
+                } else {
+                    ""
+                }
+                diagnostic = "Diagnostik: judul terambil • durasi " +
+                    durationMinutes + " menit • track caption: " +
+                    info.captionTracks.size + " • transkrip: " +
+                    sentences.size + " kalimat (sumber: " + transcriptSource + ") • " +
+                    "heatmap: " + info.heatPoints.size + " titik • audio: URL " +
+                    audioUrlText + ", " + audio.size + " detik ter-decode • Groq key: " +
+                    groqKeyText + " • skor LLM: " + llmScores.size + " segmen" + zeroText
                 if (found.isEmpty()) {
                     error = "Tidak ada sinyal highlight yang cukup: video ini " +
                         "tidak punya heatmap, transkrip, maupun audio yang " +
@@ -208,6 +238,11 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
             } catch (e: Exception) {
                 error = e.message ?: "Analisa gagal. Coba lagi."
                 status = ""
+                if (diagnostic.isBlank()) {
+                    diagnostic = "Diagnostik: metadata gagal diambil " +
+                        "(${e.message ?: "tanpa pesan"}). Track caption, " +
+                        "transkrip, heatmap, dan audio tidak diketahui."
+                }
             } finally {
                 isAnalysing = false
             }

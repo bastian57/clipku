@@ -101,6 +101,9 @@ fun MainScreen(
                 }
             }
         }
+        if (viewModel.diagnostic.isNotBlank()) {
+            Text(text = viewModel.diagnostic, style = MaterialTheme.typography.bodySmall)
+        }
         if (viewModel.videoTitle.isNotBlank()) {
             Text(text = viewModel.videoTitle, style = MaterialTheme.typography.titleMedium)
             if (viewModel.videoAuthor.isNotBlank()) {
