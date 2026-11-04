@@ -1,7 +1,7 @@
-# ClipKu v1.0.3 — Highlight Clip dari Video Panjang
+# ClipKu v1.0.4 — Highlight Clip dari Video Panjang
 
 APK Android (Kotlin native + Jetpack Compose Material3, dark premium).
-Package: `com.daftech.clipku` • versionCode 4 / versionName 1.0.3 •
+Package: `com.daftech.clipku` • versionCode 5 / versionName 1.0.4 •
 minSdk 24, targetSdk 34, compileSdk 34.
 
 ## Scope v1 (locked, gas 2026-11-04 14:30 WIB)
@@ -39,7 +39,7 @@ minSdk 24, targetSdk 34, compileSdk 34.
 Build resmi via GitHub Actions (lihat `.github/workflows/clipku-build.yml`):
 JDK 17 + Android SDK manual + Gradle 8.7 + `gradle assembleDebug`,
 gerbang keystore + gerbang sertifikat APK sebelum upload ke rolling
-release `latest`, nama file `ClipKu-v1.0.3.apk`, plus `build.log` ke
+release `latest`, nama file `ClipKu-v1.0.4.apk`, plus `build.log` ke
 release `build-log` (if: always).
 
 Build lokal (opsional): Gradle 8.7+, JDK 17, Android SDK 34, lalu

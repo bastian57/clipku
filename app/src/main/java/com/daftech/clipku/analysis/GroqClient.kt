@@ -20,7 +20,22 @@ import java.util.concurrent.TimeUnit
  * tetap memeriksa ulang dan melempar pesan yang bisa ditampilkan ke user.
  *
  * Model: gpt-oss-120b utama (sama keluarga dengan pipeline Nalar),
- * fallback gpt-oss-20b kalau model utama gagal.
+ * fallback gpt-oss-20b, lalu qwen/qwen3.8-27b (model default Phoenix/Nalar
+ * yang terbukti jalan dengan key yang sama).
+ *
+ * v1.0.4: DUA perbaikan atas kegagalan narasi + skor LLM di v1.0.3
+ * (keduanya gagal sistematis padahal key ada dan key yang sama jalan
+ * di pipeline Nalar):
+ *  1. User-Agent browser di SEMUA request Groq. Sebelum v1.0.4 klien ini
+ *     TIDAK mengirim User-Agent sama sekali (default OkHttp). Pelajaran
+ *     Nalar/Phoenix: request tanpa User-Agent browser pernah kena
+ *     Cloudflare error 1010 dari API Groq — kandidat utama gagalnya di HP.
+ *     Kandidat, bukan jaminan: butir 2 yang akan membuktikannya di HP.
+ *  2. Error asli TIDAK lagi ditelan. postOnce dulu mengembalikan null
+ *     untuk semua kegagalan (non-200, konten kosong, exception) dan
+ *     callChat melempar pesan generik yang sama. Sekarang kegagalan
+ *     terakhir dicatat (HTTP + pesan/kode error Groq, dipotong) dan
+ *     dilempar bersama pesan generik, TANPA pernah memuat API key.
  */
 class GroqClient(
     private val http: OkHttpClient = OkHttpClient.Builder()
@@ -31,8 +46,19 @@ class GroqClient(
     companion object {
         const val PRIMARY_MODEL = "openai/gpt-oss-120b"
         const val FALLBACK_MODEL = "openai/gpt-oss-20b"
+        // v1.0.4: fallback ketiga, model default Phoenix/Nalar.
+        const val QWEN_MODEL = "qwen/qwen3.8-27b"
+        private val MODELS = listOf(PRIMARY_MODEL, FALLBACK_MODEL, QWEN_MODEL)
         private const val URL = "https://api.groq.com/openai/v1/chat/completions"
+        // Sama persis dengan BROWSER_UA Innertube/AudioEnergy: pola yang
+        // dipakai Nalar untuk lolos dari penolakan berbasis User-Agent.
+        private const val BROWSER_UA =
+            "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
     }
+
+    // Kegagalan terakhir postOnce, untuk pesan error callChat.
+    // TIDAK PERNAH berisi API key: hanya HTTP + pesan error Groq.
+    private var lastError: String? = null
 
     /** Skor semantik per segmen: map segmenId -> (skor 0-100, judul, alasan). */
     data class SegmentScore(val score: Int, val title: String, val reason: String)
@@ -102,49 +128,96 @@ class GroqClient(
     }
 
     private fun callChat(apiKey: String, systemPrompt: String, userPrompt: String): String {
-        val body = JSONObject().apply {
-            put("model", PRIMARY_MODEL)
-            put("temperature", 0.4)
-            put("messages", JSONArray().apply {
-                put(JSONObject().apply {
-                    put("role", "system"); put("content", systemPrompt)
+        // v1.0.4: coba model berurutan, pertama yang berhasil menang.
+        // Signature fungsi ini TIDAK berubah: pemanggil lama (scoring dan
+        // narasi) tetap menerima String atau IllegalStateException.
+        lastError = null
+        for (model in MODELS) {
+            val body = JSONObject().apply {
+                put("model", model)
+                put("temperature", 0.4)
+                put("messages", JSONArray().apply {
+                    put(JSONObject().apply {
+                        put("role", "system"); put("content", systemPrompt)
+                    })
+                    put(JSONObject().apply {
+                        put("role", "user"); put("content", userPrompt)
+                    })
                 })
-                put(JSONObject().apply {
-                    put("role", "user"); put("content", userPrompt)
-                })
-            })
+            }
+            val result = postOnce(apiKey, body, model)
+            if (result != null) return result
         }
-        val result = postOnce(apiKey, body, PRIMARY_MODEL)
-        if (result != null) return result
-        val fallbackBody = JSONObject(body.toString()).apply { put("model", FALLBACK_MODEL) }
-        return postOnce(apiKey, fallbackBody, FALLBACK_MODEL)
-            ?: throw IllegalStateException(
-                "Groq gagal menjawab. Periksa Groq API key di Settings dan koneksi internet."
-            )
+        val detail = lastError?.take(200) ?: "tanpa detail"
+        throw IllegalStateException(
+            "Groq gagal menjawab ($detail). Periksa Groq API key di Settings dan koneksi internet."
+        )
     }
 
     private fun postOnce(apiKey: String, body: JSONObject, model: String): String? {
         return try {
             val request = Request.Builder()
                 .url(URL)
+                // v1.0.4: User-Agent browser — tanpa ini request pernah
+                // ditolak Cloudflare (pelajaran 1010 Nalar/Phoenix).
+                .header("User-Agent", BROWSER_UA)
                 .header("Authorization", "Bearer $apiKey")
                 .header("Content-Type", "application/json")
                 .post(body.toString().toRequestBody("application/json".toMediaType()))
                 .build()
             val response = http.newCall(request).execute()
+            val code = response.code
             val text = response.body?.string() ?: ""
             response.close()
-            if (!response.isSuccessful) return null
+            if (!response.isSuccessful) {
+                lastError = "HTTP $code " + groqErrorText(text)
+                return null
+            }
             val content = JSONObject(text)
                 .optJSONArray("choices")
                 ?.optJSONObject(0)
                 ?.optJSONObject("message")
                 ?.optString("content", "")
                 ?: ""
-            if (content.isBlank()) null else content
+            if (content.isBlank()) {
+                lastError = "HTTP $code jawaban kosong"
+                null
+            } else {
+                content
+            }
         } catch (e: Exception) {
+            // Jangan menimpa detail HTTP yang sudah tercatat.
+            if (lastError == null) {
+                lastError = "jaringan/timeout: " +
+                    (e.message?.take(120) ?: "tanpa pesan")
+            }
             null
         }
+    }
+
+    /**
+     * Ambil pesan/kode error Groq dari body error, tanpa API key.
+     * Bentuk Groq: {"error": {"message": "...", "code": "..."}}.
+     * Kalau tidak ter-parse, pakai potongan body mentah (maks 120 char).
+     */
+    private fun groqErrorText(bodyText: String): String {
+        return try {
+            val err = JSONObject(bodyText).optJSONObject("error")
+            if (err != null) {
+                val message = err.optString("message", "").take(150)
+                val code = err.optString("code", "")
+                when {
+                    message.isNotBlank() && code.isNotBlank() -> "$code: $message"
+                    message.isNotBlank() -> message
+                    code.isNotBlank() -> code
+                    else -> bodyText.take(120)
+                }
+            } else {
+                bodyText.take(120)
+            }
+        } catch (e: Exception) {
+            bodyText.take(120)
+        }.replace(Regex("\\s+"), " ").trim().ifEmpty { "tanpa pesan error" }
     }
 
     private fun parseScores(raw: String): Map<Int, SegmentScore> {

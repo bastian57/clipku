@@ -51,6 +51,10 @@ class WhisperClient(
     companion object {
         const val MODEL = "whisper-large-v3-turbo"
         private const val URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+        // v1.0.4: User-Agent browser, sama seperti GroqClient — jalur
+        // Whisper tidak boleh gagal hanya karena User-Agent default.
+        private const val BROWSER_UA =
+            "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
     }
 
     /** Transkrip teks polos dari [audioFile] (file clip ~60 detik). */
@@ -72,16 +76,29 @@ class WhisperClient(
                 .build()
             val request = Request.Builder()
                 .url(URL)
+                .header("User-Agent", BROWSER_UA)
                 .header("Authorization", "Bearer $apiKey")
                 .post(body)
                 .build()
             val response = http.newCall(request).execute()
+            val code = response.code
             val text = response.body?.string() ?: ""
             response.close()
             if (!response.isSuccessful) {
+                // v1.0.4: sertakan pesan error Groq (tanpa API key),
+                // bukan cuma kode HTTP, supaya penyebabnya terbaca.
+                val detail = try {
+                    JSONObject(text).optJSONObject("error")
+                        ?.optString("message", "")?.take(150)
+                        ?.replace(Regex("\\s+"), " ")?.trim()
+                        ?: ""
+                } catch (e: Exception) {
+                    ""
+                }
                 throw IllegalStateException(
-                    "Whisper gagal (HTTP ${response.code}). " +
-                        "Periksa Groq API key di Settings, kuota, dan koneksi internet."
+                    "Whisper gagal (HTTP $code" +
+                        (if (detail.isNotBlank()) ": $detail" else "") +
+                        "). Periksa Groq API key di Settings, kuota, dan koneksi internet."
                 )
             }
             JSONObject(text).optString("text", "").trim()

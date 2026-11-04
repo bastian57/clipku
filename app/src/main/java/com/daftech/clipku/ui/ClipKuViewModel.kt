@@ -221,6 +221,8 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                 val segments = Scoring.buildSegments(sentences)
 
                 var llmScores: Map<Int, GroqClient.SegmentScore> = emptyMap()
+                // v1.0.4: pesan error Groq asli disimpan untuk diagnostik.
+                var llmError: String? = null
                 val key = prefs.groqApiKey.trim()
                 if (key.isNotBlank() && segments.isNotEmpty()) {
                     status = "Menilai highlight dengan Groq…"
@@ -236,6 +238,9 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                         llmScores = groq.scoreSegments(key, info.title, inputs)
                     } catch (e: Exception) {
                         // Skor LLM gagal = lanjut dengan heatmap + audio saja.
+                        // Pesan error TIDAK pernah memuat API key (GroqClient
+                        // hanya mencatat HTTP + pesan error Groq).
+                        llmError = e.message?.take(200)
                         status = "Skor LLM gagal, lanjut dengan heatmap + audio."
                         llmScores = emptyMap()
                     }
@@ -286,7 +291,8 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                     audioResult.downloadedBytes + " • audio mime: " +
                     audioResult.mime.ifEmpty { "-" } + " • stream dicoba: " +
                     audioResult.streamsTried + audioErrorText + " • Groq key: " +
-                    groqKeyText + " • skor LLM: " + llmScores.size + " segmen" + zeroText
+                    groqKeyText + " • skor LLM: " + llmScores.size + " segmen" +
+                    (if (llmError != null) " (gagal: " + llmError + ")" else "") + zeroText
                 if (found.isEmpty()) {
                     error = "Tidak ada sinyal highlight yang cukup: video ini " +
                         "tidak punya heatmap, transkrip, maupun audio yang " +
