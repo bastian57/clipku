@@ -168,7 +168,23 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                 var audioUrls: List<String> = listOfNotNull(info.stream.audioUrl)
                 status = "Mencari stream via NewPipe…"
                 try {
-                    val newPipe = NewPipeStreamExtractor.extract(videoId)
+                    // v1.0.5: hint bahasa video untuk ranking audio
+                    // NewPipe — "id" kalau ada caption id, kalau tidak
+                    // bahasa caption pertama (Innertube). Null kalau
+                    // tidak ada caption sama sekali (NewPipe menentukan
+                    // sendiri, lalu default "id").
+                    val preferredLanguage = if (info.captionTracks.any {
+                            it.languageCode.startsWith("id")
+                        }
+                    ) {
+                        "id"
+                    } else {
+                        info.captionTracks.firstOrNull()?.languageCode
+                            ?.take(2)?.lowercase()
+                    }
+                    val newPipe = NewPipeStreamExtractor.extract(
+                        videoId, preferredLanguage
+                    )
                     if (newPipe.audioUrl != null || newPipe.videoUrl != null) {
                         info = info.copy(
                             stream = VideoStream(
@@ -176,7 +192,17 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                                 videoOnlyUrl = newPipe.videoUrl
                                     ?: info.stream.videoOnlyUrl,
                                 audioUrl = newPipe.audioUrl ?: info.stream.audioUrl,
-                                mimeProgressive = info.stream.mimeProgressive
+                                mimeProgressive = info.stream.mimeProgressive,
+                                // v1.0.5: deskripsi track mengikuti SUMBER
+                                // audioUrl yang menang (NewPipe kalau
+                                // NewPipe yang memberi audio).
+                                audioTrackDescription = if (newPipe.audioUrl != null) {
+                                    newPipe.audioTrackDescription.ifEmpty {
+                                        info.stream.audioTrackDescription
+                                    }
+                                } else {
+                                    info.stream.audioTrackDescription
+                                }
                             )
                         )
                         if (newPipe.audioUrl != null) {
@@ -286,6 +312,10 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                     ", track dicoba: " + tracksTried + ") • " +
                     "heatmap: " + info.heatPoints.size + " titik • audio: URL " +
                     audioUrlText + ", " + audio.size + " detik ter-decode • " +
+                    // v1.0.5: track audio yang dipilih (bahasa + tipe +
+                    // nama), mis. "audio track: id, original".
+                    "audio track: " +
+                    info.stream.audioTrackDescription.ifEmpty { "-" } + " • " +
                     "sumber stream: " + streamSource + " • audio HTTP: " +
                     audioResult.httpCode + " • audio byte: " +
                     audioResult.downloadedBytes + " • audio mime: " +

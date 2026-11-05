@@ -103,7 +103,16 @@ class InnertubeClient(
                             ?: androidInfo.stream.videoOnlyUrl,
                         audioUrl = info.stream.audioUrl
                             ?: androidInfo.stream.audioUrl,
-                        mimeProgressive = info.stream.mimeProgressive
+                        mimeProgressive = info.stream.mimeProgressive,
+                        // v1.0.5: deskripsi track mengikuti SUMBER audioUrl
+                        // yang menang (WEB kalau WEB punya audio, kalau
+                        // tidak ANDROID) — jangan sampai deskripsi
+                        // ANDROID menempel di URL WEB atau sebaliknya.
+                        audioTrackDescription = if (info.stream.audioUrl != null) {
+                            info.stream.audioTrackDescription
+                        } else {
+                            androidInfo.stream.audioTrackDescription
+                        }
                     )
                     info = info.copy(
                         stream = mergedStream,
@@ -186,19 +195,25 @@ class InnertubeClient(
             )
         }
 
+        val captions = parseCaptions(root)
+        val heat = HeatmapParser.parse(root)
         val streaming = root.optJSONObject("streamingData") ?: JSONObject()
         val progressive = pickProgressive(streaming.optJSONArray("formats"))
         val adaptiveVideo = pickAdaptiveVideo(streaming.optJSONArray("adaptiveFormats"))
-        val adaptiveAudio = pickAdaptiveAudio(streaming.optJSONArray("adaptiveFormats"))
+        // v1.0.5: caption dibaca DULU supaya bahasa video diketahui
+        // sebelum audio dipilih (ranking butuh bahasa preferensi).
+        val adaptiveAudio = pickAdaptiveAudio(
+            streaming.optJSONArray("adaptiveFormats"),
+            preferredLanguageFromCaptions(captions)
+        )
         val stream = VideoStream(
             progressiveUrl = progressive,
             videoOnlyUrl = adaptiveVideo,
-            audioUrl = adaptiveAudio,
-            mimeProgressive = null
+            audioUrl = adaptiveAudio?.url,
+            mimeProgressive = null,
+            audioTrackDescription = adaptiveAudio?.description ?: ""
         )
 
-        val captions = parseCaptions(root)
-        val heat = HeatmapParser.parse(root)
         return VideoInfo(
             videoId = videoId,
             title = title,
@@ -258,9 +273,33 @@ class InnertubeClient(
         return best
     }
 
-    private fun pickAdaptiveAudio(formats: JSONArray?): String? {
+    /**
+     * v1.0.5: pilih audio ADAPTIVE sadar-bahasa, bukan bitrate tertinggi
+     * buta. Tiap format adaptive membawa `audioTrack`:
+     * `{ "displayName": "Bahasa Indonesia", "id": "...",
+     * "audioIsDefault": true }` — Innertube TIDAK memberi flag
+     * ORIGINAL/DUBBED eksplisit seperti NewPipe, jadi tipenya
+     * dilaporkan jujur sebagai "default"/"non-default" (lihat
+     * describeInnertubeAudio), bukan diklaim "original".
+     * Ranking (angka kecil menang):
+     *  0 = default + bahasa cocok dengan bahasa video
+     *  1 = bahasa cocok (bukan default)
+     *  2 = default (bahasa lain / bahasa tidak diketahui)
+     *  3 = displayName mengandung "original"
+     *  4 = sisanya
+     * Di dalam satu tingkat: bitrate tertinggi (fallback lama).
+     * Track dub TIDAK PERNAH menang hanya karena bitrate-nya lebih
+     * besar — itu bug v1.0.4 (clip Rocky Gerung jadi berbahasa Inggris).
+     */
+    private data class AdaptiveAudioPick(val url: String, val description: String)
+
+    private fun pickAdaptiveAudio(
+        formats: JSONArray?,
+        preferred: String
+    ): AdaptiveAudioPick? {
         if (formats == null) return null
-        var best: String? = null
+        var best: AdaptiveAudioPick? = null
+        var bestRank = Int.MAX_VALUE
         var bestBitrate = -1
         for (i in 0 until formats.length()) {
             val item = formats.optJSONObject(i) ?: continue
@@ -268,12 +307,69 @@ class InnertubeClient(
             if (!mime.startsWith("audio/")) continue
             val bitrate = item.optInt("bitrate", 0)
             val url = item.optString("url", "").ifEmpty { null } ?: continue
-            if (bitrate > bestBitrate) {
+            val track = item.optJSONObject("audioTrack")
+            val isDefault = track?.optBoolean("audioIsDefault", false) == true
+            val displayName = track?.optString("displayName", "")?.trim() ?: ""
+            val lang = languageFromDisplayName(displayName)
+            val rank = when {
+                isDefault && lang == preferred -> 0
+                lang == preferred -> 1
+                isDefault -> 2
+                "original" in displayName.lowercase() -> 3
+                else -> 4
+            }
+            if (rank < bestRank || (rank == bestRank && bitrate > bestBitrate)) {
+                bestRank = rank
                 bestBitrate = bitrate
-                best = url
+                best = AdaptiveAudioPick(
+                    url,
+                    describeInnertubeAudio(lang, isDefault, displayName)
+                )
             }
         }
         return best
+    }
+
+    /**
+     * Bahasa video dari caption: "id" kalau ada track caption id,
+     * kalau tidak bahasa caption pertama, kalau tidak ada caption
+     * sama sekali default "id" (pengguna utama berbahasa Indonesia;
+     * ranking tetap jatuh ke default/bitrate kalau video ternyata
+     * bukan Indonesia dan tidak ada info bahasa).
+     */
+    private fun preferredLanguageFromCaptions(tracks: List<CaptionTrack>): String {
+        if (tracks.any { it.languageCode.startsWith("id") }) return "id"
+        val first = tracks.firstOrNull()?.languageCode
+            ?.take(2)?.lowercase()?.takeIf { it.isNotBlank() }
+        return first ?: "id"
+    }
+
+    /** displayName ("Bahasa Indonesia" / "English") -> kode 2 huruf, null kalau tidak dikenal. */
+    private fun languageFromDisplayName(displayName: String): String? {
+        val lower = displayName.lowercase()
+        return when {
+            "indonesia" in lower -> "id"
+            "english" in lower || "inggris" in lower -> "en"
+            "javanese" in lower || lower.contains("jawa") -> "jv"
+            "sundanese" in lower || lower.contains("sunda") -> "su"
+            "malay" in lower || "melayu" in lower -> "ms"
+            else -> null
+        }
+    }
+
+    /** "id, default (Bahasa Indonesia)" / "en, non-default (English)" / "?, non-default". */
+    private fun describeInnertubeAudio(
+        lang: String?,
+        isDefault: Boolean,
+        displayName: String
+    ): String {
+        val langText = lang ?: "?"
+        val typeText = if (isDefault) "default" else "non-default"
+        return if (displayName.isNotBlank() && displayName.lowercase() != langText) {
+            "$langText, $typeText ($displayName)"
+        } else {
+            "$langText, $typeText"
+        }
     }
 
     private fun parseCaptions(root: JSONObject): List<CaptionTrack> {

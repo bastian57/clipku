@@ -7,6 +7,7 @@ import okhttp3.OkHttpClient
 import org.schabi.newpipe.extractor.NewPipe
 import org.schabi.newpipe.extractor.ServiceList
 import org.schabi.newpipe.extractor.stream.AudioStream
+import org.schabi.newpipe.extractor.stream.AudioTrackType
 import org.schabi.newpipe.extractor.stream.StreamExtractor
 import org.schabi.newpipe.extractor.stream.SubtitlesStream
 import org.schabi.newpipe.extractor.stream.VideoStream
@@ -23,8 +24,21 @@ import java.util.concurrent.TimeUnit
  * menulis decipher sendiri, itu di luar scope dan rapuh.
  *
  * Yang dipakai dari NewPipe di sini HANYA stream + subtitle:
- *  - audioUrl: stream audio terbaik (diutamakan audio/mp4, sisanya
- *    stream audio pertama yang URL-nya tidak kosong).
+ *  - audioUrl: stream audio terbaik menurut ranking v1.0.5 — BUKAN
+ *    lagi "mp4 dulu" buta. Urutan: (a) track ORIGINAL yang bahasanya
+ *    sama dengan bahasa video, (b) track apa pun yang bahasanya sama,
+ *    (c) track ORIGINAL bahasa lain, (d) nama track mengandung
+ *    "original", (e) track bukan DUBBED/DESCRIPTIVE, (f) sisanya.
+ *    Di dalam satu tingkat, mp4 dulu lalu bitrate tertinggi. Track
+ *    dub TIDAK PERNAH menang hanya karena format/bitrate-nya lebih
+ *    besar — itu bug v1.0.4 (clip Rocky Gerung jadi berbahasa Inggris).
+ *    Bahasa video diutamakan dari hint ViewModel (bahasa caption
+ *    Innertube), lalu caption NewPipe, lalu getLanguageInfo().
+ *    Semua getter NPE (getAudioLocale/getAudioTrackType/
+ *    getAudioTrackName/getLanguageInfo) dibungkus try/catch: null di
+ *    salah satunya = jatuh ke tingkat berikutnya, bukan crash, dan
+ *    kalau semua info bahasa null, ranking jatuh ke bitrate seperti
+ *    dulu (fallback lama dipertahankan, bukan dihapus).
  *  - videoUrl: stream video <=720p tertinggi; kalau tidak ada, stream
  *    video terendah di atas 720p (tetap bisa dipakai, hanya lebih besar).
  *    Nilai ini dipakai sebagai videoOnlyUrl, BUKAN progressiveUrl —
@@ -48,7 +62,11 @@ data class NewPipeStreamResult(
     val subtitles: List<CaptionTrack>,
     // v1.0.3: semua URL audio, mp4 dulu lalu sisanya, tanpa duplikat.
     // audioUrl di atas tetap = elemen pertama daftar ini (kompatibilitas).
-    val audioUrls: List<String> = emptyList()
+    // v1.0.5: daftar ini sekarang diurutkan ranking sadar-bahasa
+    // (lihat pickAudioStreams), bukan lagi mp4 dulu.
+    val audioUrls: List<String> = emptyList(),
+    /** v1.0.5: deskripsi track audio yang dipilih, mis. "id, original". */
+    val audioTrackDescription: String = ""
 )
 
 object NewPipeStreamExtractor {
@@ -58,6 +76,12 @@ object NewPipeStreamExtractor {
 
     suspend fun extract(
         videoId: String,
+        /**
+         * v1.0.5: hint bahasa video (kode 2 huruf, mis. "id"), dihitung
+         * ViewModel dari bahasa caption Innertube. Null = NewPipe
+         * menentukan sendiri dari caption/getLanguageInfo, lalu "id".
+         */
+        preferredLanguage: String? = null,
         http: OkHttpClient = OkHttpClient.Builder()
             .connectTimeout(20, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
@@ -73,12 +97,6 @@ object NewPipeStreamExtractor {
             val url = "https://www.youtube.com/watch?v=$videoId"
             val extractor: StreamExtractor = ServiceList.YouTube.getStreamExtractor(url)
             extractor.fetchPage()
-            val audioList = pickAudioUrls(extractor.audioStreams)
-            val audio = audioList.firstOrNull()
-            val video = pickVideo(
-                (extractor.videoStreams ?: emptyList()) +
-                    (extractor.videoOnlyStreams ?: emptyList())
-            )
             val subtitles = try {
                 (extractor.subtitlesDefault ?: emptyList()).mapNotNull { track ->
                     mapSubtitle(track)
@@ -86,27 +104,150 @@ object NewPipeStreamExtractor {
             } catch (e: Exception) {
                 emptyList()
             }
-            NewPipeStreamResult(audio, video, subtitles, audioList)
+            // v1.0.5: bahasa video — hint ViewModel dulu, lalu caption
+            // NewPipe, lalu getLanguageInfo() (NPE v0.26.5, Locale),
+            // lalu caption pertama, lalu default "id".
+            val videoLanguage = try {
+                extractor.languageInfo?.language
+            } catch (e: Exception) {
+                null
+            }
+            val preferred = preferredLanguage(
+                preferredLanguage, subtitles, videoLanguage
+            )
+            val rankedAudio = pickAudioStreams(extractor.audioStreams, preferred)
+            val audio = rankedAudio.firstOrNull()?.url
+            val audioDescription = rankedAudio.firstOrNull()
+                ?.let { describeAudio(it) } ?: ""
+            val video = pickVideo(
+                (extractor.videoStreams ?: emptyList()) +
+                    (extractor.videoOnlyStreams ?: emptyList())
+            )
+            NewPipeStreamResult(
+                audio,
+                video,
+                subtitles,
+                rankedAudio.mapNotNull { it.url }.filter { it.isNotEmpty() }.distinct(),
+                audioDescription
+            )
         } catch (e: Exception) {
             NewPipeStreamResult(null, null, emptyList())
         }
     }
 
-    /** URL audio berurutan: mp4 dulu, lalu sisanya, tanpa duplikat. */
-    private fun pickAudioUrls(streams: List<AudioStream>?): List<String> {
+    /**
+     * v1.0.5: bahasa yang dipakai ranking audio. Urutan sumber, pertama
+     * yang ada menang. "in" (kode Java lama untuk Bahasa Indonesia)
+     * dinormalisasi ke "id" supaya cocok dengan bahasa caption.
+     */
+    private fun preferredLanguage(
+        hint: String?,
+        subtitles: List<CaptionTrack>,
+        videoLanguage: String?
+    ): String {
+        val hintLang = normaliseLang(hint)
+        if (hintLang != null) return hintLang
+        if (subtitles.any { it.languageCode.startsWith("id") }) return "id"
+        val videoLang = normaliseLang(videoLanguage)
+        if (videoLang != null) return videoLang
+        val firstCaption = normaliseLang(
+            subtitles.firstOrNull()?.languageCode
+        )
+        if (firstCaption != null) return firstCaption
+        return "id"
+    }
+
+    private fun normaliseLang(code: String?): String? {
+        val lang = code?.trim()?.lowercase()?.take(2)?.takeIf { it.isNotBlank() }
+            ?: return null
+        return if (lang == "in") "id" else lang
+    }
+
+    /**
+     * v1.0.5: ranking audio sadar-bahasa. Tingkat (angka kecil menang):
+     *  0 = ORIGINAL + bahasa cocok dengan bahasa video
+     *  1 = bahasa cocok (tipe apa pun)
+     *  2 = ORIGINAL (bahasa lain / bahasa tidak diketahui)
+     *  3 = nama track mengandung "original"
+     *  4 = bukan DUBBED dan bukan DESCRIPTIVE
+     *  5 = sisanya (DUBBED / DESCRIPTIVE)
+     * Di dalam satu tingkat: format mp4 dulu, lalu bitrate tertinggi
+     * (fallback lama). Semua getter NPE dibungkus try/catch — null =
+     * tingkat berikutnya, bukan crash.
+     */
+    private fun pickAudioStreams(
+        streams: List<AudioStream>?,
+        preferred: String
+    ): List<AudioStream> {
         if (streams.isNullOrEmpty()) return emptyList()
-        val withUrl = streams.mapNotNull { it.url }.filter { it.isNotEmpty() }.distinct()
+        val withUrl = streams.filter { !it.url.isNullOrEmpty() }
         if (withUrl.isEmpty()) return emptyList()
-        val mp4 = withUrl.filter { url ->
-            streams.any { stream ->
-                stream.url == url && try {
-                    stream.format?.mimeType?.contains("mp4") == true
-                } catch (e: Exception) {
-                    false
-                }
-            }
+        return withUrl.sortedWith(
+            compareBy<AudioStream> { audioRank(it, preferred) }
+                .thenByDescending { isMp4(it) }
+                .thenByDescending { bitrateOf(it) }
+        )
+    }
+
+    private fun audioRank(stream: AudioStream, preferred: String): Int {
+        val localeLang = try {
+            normaliseLang(stream.audioLocale?.language)
+        } catch (e: Exception) {
+            null
         }
-        return (mp4 + withUrl.filter { it !in mp4 }).distinct()
+        val type = try { stream.audioTrackType } catch (e: Exception) { null }
+        val name = try {
+            stream.audioTrackName?.lowercase() ?: ""
+        } catch (e: Exception) {
+            ""
+        }
+        val localeMatches = localeLang != null && localeLang == preferred
+        return when {
+            type == AudioTrackType.ORIGINAL && localeMatches -> 0
+            localeMatches -> 1
+            type == AudioTrackType.ORIGINAL -> 2
+            "original" in name -> 3
+            type != AudioTrackType.DUBBED &&
+                type != AudioTrackType.DESCRIPTIVE -> 4
+            else -> 5
+        }
+    }
+
+    private fun isMp4(stream: AudioStream): Boolean = try {
+        stream.format?.mimeType?.contains("mp4") == true
+    } catch (e: Exception) {
+        false
+    }
+
+    private fun bitrateOf(stream: AudioStream): Int = try {
+        val bitrate = stream.bitrate
+        if (bitrate > 0) bitrate else stream.averageBitrate.takeIf { it > 0 } ?: 0
+    } catch (e: Exception) {
+        0
+    }
+
+    /** "id, original" / "en, dubbed" / "?, unknown" (+ nama track kalau ada). */
+    private fun describeAudio(stream: AudioStream): String {
+        val lang = try {
+            normaliseLang(stream.audioLocale?.language)
+        } catch (e: Exception) {
+            null
+        } ?: "?"
+        val type = try {
+            stream.audioTrackType?.name?.lowercase()
+        } catch (e: Exception) {
+            null
+        } ?: "unknown"
+        val name = try {
+            stream.audioTrackName?.trim()?.takeIf { it.isNotEmpty() }
+        } catch (e: Exception) {
+            null
+        }
+        return if (name != null && name.lowercase() != lang) {
+            "$lang, $type ($name)"
+        } else {
+            "$lang, $type"
+        }
     }
 
     private fun pickVideo(streams: List<VideoStream>): String? {

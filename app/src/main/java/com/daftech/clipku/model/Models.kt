@@ -21,7 +21,16 @@ data class VideoStream(
     val videoOnlyUrl: String?,
     /** URL audio-only terbaik, kalau ada. */
     val audioUrl: String?,
-    val mimeProgressive: String?
+    val mimeProgressive: String?,
+    /**
+     * v1.0.5: deskripsi track audio yang dipilih untuk [audioUrl],
+     * mis. "id, original" / "en, dubbed" / "unknown". Dibawa di
+     * VideoStream supaya merge Innertube WEB+ANDROID dan merge NewPipe
+     * tidak kehilangan info track mana yang kepilih — diagnostik
+     * menampilkannya apa adanya. Kosong kalau audioUrl null atau
+     * sumbernya tidak memberi info track.
+     */
+    val audioTrackDescription: String = ""
 )
 
 /** Metadata + bahan analisa yang didapat dari Innertube, tanpa mengunduh video. */

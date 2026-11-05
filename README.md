@@ -1,7 +1,7 @@
-# ClipKu v1.0.4 — Highlight Clip dari Video Panjang
+# ClipKu v1.0.5 — Highlight Clip dari Video Panjang
 
 APK Android (Kotlin native + Jetpack Compose Material3, dark premium).
-Package: `com.daftech.clipku` • versionCode 5 / versionName 1.0.4 •
+Package: `com.daftech.clipku` • versionCode 6 / versionName 1.0.5 •
 minSdk 24, targetSdk 34, compileSdk 34.
 
 ## Scope v1 (locked, gas 2026-11-04 14:30 WIB)
@@ -24,8 +24,13 @@ minSdk 24, targetSdk 34, compileSdk 34.
 ## Mesin
 
 - Stream/metadata: Innertube player API via OkHttp (utama v1).
-  NewPipeExtractor sengaja tidak dibundel, yt-dlp-android hanya fallback
-  terdokumentasi — lihat BUILD-NOTES.md di folder induk.
+  NewPipeExtractor v0.26.5 via JitPack adalah sumber stream PERTAMA
+  (decipher signature) — lihat BUILD-NOTES.md di folder induk.
+  v1.0.5: picker audio SADAR BAHASA di kedua jalur (NewPipe +
+  Innertube adaptive) — track ORIGINAL berbahasa video diutamakan,
+  track dub tidak pernah menang hanya karena format/bitrate; track
+  yang dipilih tampil di diagnostik ("audio track: id, original").
+  yt-dlp-android hanya fallback terdokumentasi.
 - Scoring: heatmap Most Replayed (best-effort) + transkrip VTT +
   skor LLM Groq + energi audio RMS per detik. Merge puncak dekat,
   buang tumpang tindih, ranking Top 6.
@@ -39,7 +44,7 @@ minSdk 24, targetSdk 34, compileSdk 34.
 Build resmi via GitHub Actions (lihat `.github/workflows/clipku-build.yml`):
 JDK 17 + Android SDK manual + Gradle 8.7 + `gradle assembleDebug`,
 gerbang keystore + gerbang sertifikat APK sebelum upload ke rolling
-release `latest`, nama file `ClipKu-v1.0.4.apk`, plus `build.log` ke
+release `latest`, nama file `ClipKu-v1.0.5.apk`, plus `build.log` ke
 release `build-log` (if: always).
 
 Build lokal (opsional): Gradle 8.7+, JDK 17, Android SDK 34, lalu
