@@ -54,6 +54,21 @@ class GroqClient(
         // dipakai Nalar untuk lolos dari penolakan berbasis User-Agent.
         private const val BROWSER_UA =
             "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
+        // v1.0.7 — chunking scoring (riset bagian A/F upgrade #3:
+        // AI-Shorts 20 mnt/60 dtk overlap, SupoClip 12 mnt/2 mnt
+        // overlap). Dipilih 12 menit / 90 detik: satu jendela = ~8
+        // segmen 90 detik x maks 1200 karakter = maks ~9.600 karakter
+        // ≈ 2.400 token + prompt — jauh di bawah batas input-token per
+        // menit yang membunuh tes ALI 91 menit di v1.0.6 (satu call
+        // ~61 segmen ≈ 73.000 karakter → HTTP 413 di qwen3.8-27b).
+        // Video pendek (<12 menit) tetap satu jendela, sama seperti dulu.
+        // SATU companion object saja per class (Kotlin) — konstanta ini
+        // WAJIB di sini, bukan di companion object kedua (itu yang
+        // bikin v1.0.7 merah: "Only one companion object is allowed").
+        const val WINDOW_MS = 12 * 60_000L
+        const val WINDOW_OVERLAP_MS = 90_000L
+        /** Batas keras teks per call scoring (segmen sudah dipotong 1200 char di pemanggil). */
+        const val MAX_CHARS_PER_CALL = 12_000
     }
 
     // Kegagalan terakhir postOnce, untuk pesan error callChat.
@@ -88,21 +103,6 @@ class GroqClient(
     )
 
     data class RerankResult(val id: Int, val rank: Int, val score: Int)
-
-    companion object {
-        // v1.0.7 — chunking scoring (riset bagian A/F upgrade #3:
-        // AI-Shorts 20 mnt/60 dtk overlap, SupoClip 12 mnt/2 mnt
-        // overlap). Dipilih 12 menit / 90 detik: satu jendela = ~8
-        // segmen 90 detik x maks 1200 karakter = maks ~9.600 karakter
-        // ≈ 2.400 token + prompt — jauh di bawah batas input-token per
-        // menit yang membunuh tes ALI 91 menit di v1.0.6 (satu call
-        // ~61 segmen ≈ 73.000 karakter → HTTP 413 di qwen3.8-27b).
-        // Video pendek (<12 menit) tetap satu jendela, sama seperti dulu.
-        const val WINDOW_MS = 12 * 60_000L
-        const val WINDOW_OVERLAP_MS = 90_000L
-        /** Batas keras teks per call scoring (segmen sudah dipotong 1200 char di pemanggil). */
-        const val MAX_CHARS_PER_CALL = 12_000
-    }
 
     /**
      * v1.0.7 — scoring ber-chunk dengan isolasi gagal per jendela.
