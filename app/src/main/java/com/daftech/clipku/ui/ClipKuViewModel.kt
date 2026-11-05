@@ -310,6 +310,15 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                     info.captionTracks.size + " • transkrip: " +
                     sentences.size + " kalimat (sumber: " + transcriptSource +
                     ", track dicoba: " + tracksTried + ") • " +
+                    // v1.0.6: sumber analisa — caption kalau transkrip
+                    // ada (jalur transcript-first, v1.0.1), audio-saja
+                    // kalau tidak ada caption (Whisper di sini HANYA
+                    // dipakai per clip untuk narasi, bukan analisa).
+                    "analisa: " + if (sentences.isNotEmpty()) {
+                        "caption"
+                    } else {
+                        "audio-saja"
+                    } + " • " +
                     "heatmap: " + info.heatPoints.size + " titik • audio: URL " +
                     audioUrlText + ", " + audio.size + " detik ter-decode • " +
                     // v1.0.5: track audio yang dipilih (bahasa + tipe +
@@ -364,13 +373,22 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch {
             updateClip(clip.index) { it.copy(isDownloading = true) }
             try {
-                val path = withContext(Dispatchers.IO) {
-                    ClipDownload.downloadClip(getApplication(), info, clip)
+                val result = withContext(Dispatchers.IO) {
+                    ClipDownload.downloadClipDetailed(getApplication(), info, clip)
                 }
                 updateClip(clip.index) {
-                    it.copy(isDownloading = false, savedPath = path)
+                    it.copy(isDownloading = false, savedPath = result.path)
                 }
-                status = "Clip ${clip.index} tersimpan: $path"
+                // v1.0.6: jalur ekspor yang dipakai dicatat di
+                // diagnostik (segment vs full-download) — bukti
+                // jalurnya terlihat, bukan cuma dirasakan waktunya.
+                val exportNote = " • clip ${clip.index}: ${result.method}"
+                diagnostic = if (diagnostic.isBlank()) {
+                    "clip ${clip.index}: ${result.method}"
+                } else {
+                    diagnostic + exportNote
+                }
+                status = "Clip ${clip.index} tersimpan: ${result.path} (${result.method})"
             } catch (e: Exception) {
                 updateClip(clip.index) { it.copy(isDownloading = false) }
                 error = e.message ?: "Download clip gagal."
