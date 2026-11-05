@@ -270,6 +270,32 @@ object Scoring {
         return Pair(startMs, endMs)
     }
 
+    /**
+     * v1.0.7 — dedupe kandidat: dua clip yang tumpang tindih >50%
+     * dari durasi clip yang lebih pendek, yang skor fused-nya lebih
+     * rendah dibuang. (Dalam praktik MIN_PEAK_GAP_MS 75 dtk sudah
+     * membuat ini jarang terpicu — clip 50-70 dtk dengan puncak
+     * berjarak >=75 dtk hampir tidak pernah overlap >50% — tapi
+     * pass ini menjaga jaminan dedupe tetap berlaku apa pun jalur
+     * yang menghasilkan kandidat, termasuk setelah rerank.)
+     */
+    fun dedupeClips(clips: List<Clip>): List<Clip> {
+        val sorted = clips.sortedByDescending { it.score }
+        val kept = mutableListOf<Clip>()
+        for (candidate in sorted) {
+            val candidateDuration = max(1L, candidate.endMs - candidate.startMs)
+            val overlaps = kept.any { other ->
+                val overlapStart = max(candidate.startMs, other.startMs)
+                val overlapEnd = minOf(candidate.endMs, other.endMs)
+                val overlap = overlapEnd - overlapStart
+                val shorter = minOf(candidateDuration, max(1L, other.endMs - other.startMs))
+                overlap > 0 && overlap * 2 > shorter
+            }
+            if (!overlaps) kept.add(candidate)
+        }
+        return kept.sortedBy { it.startMs }
+    }
+
     fun label(startMs: Long, endMs: Long): String {
         return "${VideoId.formatMs(startMs)} - ${VideoId.formatMs(endMs)}"
     }

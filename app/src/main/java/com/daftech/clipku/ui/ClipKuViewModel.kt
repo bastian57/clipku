@@ -249,6 +249,8 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                 var llmScores: Map<Int, GroqClient.SegmentScore> = emptyMap()
                 // v1.0.4: pesan error Groq asli disimpan untuk diagnostik.
                 var llmError: String? = null
+                // v1.0.7: jejak jendela scoring (chunked) untuk diagnostik.
+                var llmWindowsText = ""
                 val key = prefs.groqApiKey.trim()
                 if (key.isNotBlank() && segments.isNotEmpty()) {
                     status = "Menilai highlight dengan Groq…"
@@ -261,7 +263,24 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                                 text = segment.text.take(1200)
                             )
                         }
-                        llmScores = groq.scoreSegments(key, info.title, inputs)
+                        // v1.0.7: scoring ber-chunk — video 91 menit
+                        // (ALI, v1.0.6) mengirim ~61 segmen dalam SATU
+                        // call dan kena HTTP 413 di qwen3.8-27b. Kini
+                        // tiap call maks ~8 segmen / 12 menit; satu
+                        // jendela gagal tidak menolkan video.
+                        val chunked = groq.scoreSegmentsChunked(key, info.title, inputs)
+                        llmScores = chunked.scores
+                        llmWindowsText = " • jendela LLM: " +
+                            chunked.windowsSucceeded + "/" +
+                            chunked.windowsTotal + " berhasil"
+                        if (chunked.windowsFailed > 0) {
+                            // Error terakhir dicatat, skor yang berhasil
+                            // dari jendela lain tetap dipakai.
+                            llmError = chunked.lastError
+                            status = "Skor LLM sebagian gagal " +
+                                "(${chunked.windowsFailed} jendela), " +
+                                "lanjut dengan yang berhasil."
+                        }
                     } catch (e: Exception) {
                         // Skor LLM gagal = lanjut dengan heatmap + audio saja.
                         // Pesan error TIDAK pernah memuat API key (GroqClient
@@ -272,7 +291,7 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                     }
                 }
 
-                val found = Scoring.selectClips(
+                val foundRaw = Scoring.selectClips(
                     Scoring.AnalysisInput(
                         durationMs = info.durationMs,
                         sentences = sentences,
@@ -283,6 +302,40 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                     ),
                     info.title
                 )
+                // v1.0.7: dedupe kandidat overlap >50% (skor lebih
+                // rendah dibuang), lalu SATU rerank komparatif atas
+                // kandidat final. Rerank gagal = urutan semula dipakai.
+                var found = Scoring.dedupeClips(foundRaw)
+                if (key.isNotBlank() && found.size >= 2 && llmScores.isNotEmpty()) {
+                    try {
+                        val candidates = found.map { clip ->
+                            GroqClient.RerankInput(
+                                id = clip.index,
+                                startLabel = VideoId.formatMs(clip.startMs),
+                                endLabel = VideoId.formatMs(clip.endMs),
+                                title = clip.title,
+                                reason = clip.reason,
+                                score = (clip.score * 100).toInt().coerceIn(0, 100),
+                                text = clip.transcript.take(1200)
+                            )
+                        }
+                        val ranking = groq.rerankClips(key, info.title, candidates)
+                        if (ranking != null) {
+                            val rankById = ranking.associate { it.id to it.rank }
+                            val reranked = found.sortedBy { rankById[it.index] ?: 99 }
+                            // Re-index 1..N sesuai urutan rerank; isi
+                            // clip (waktu, judul, alasan, transkrip)
+                            // tidak diubah — rerank hanya mengurutkan.
+                            found = Scoring.dedupeClips(
+                                reranked.mapIndexed { i, clip ->
+                                    clip.copy(index = i + 1)
+                                }
+                            ).mapIndexed { i, clip -> clip.copy(index = i + 1) }
+                        }
+                    } catch (e: Exception) {
+                        // Rerank gagal = urutan semula, bukan error analisa.
+                    }
+                }
                 // v1.0.1 DIAGNOSTIK: angka nyata per sinyal, sukses maupun
                 // gagal, supaya kegagalan berikutnya langsung ketahuan
                 // sinyal mana yang nol dan kenapa (bukan pesan generik).
@@ -331,7 +384,9 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                     audioResult.mime.ifEmpty { "-" } + " • stream dicoba: " +
                     audioResult.streamsTried + audioErrorText + " • Groq key: " +
                     groqKeyText + " • skor LLM: " + llmScores.size + " segmen" +
-                    (if (llmError != null) " (gagal: " + llmError + ")" else "") + zeroText
+                    (if (llmError != null) " (gagal: " + llmError + ")" else "") +
+                    // v1.0.7: berapa jendela scoring yang berhasil/gagal.
+                    llmWindowsText + zeroText
                 if (found.isEmpty()) {
                     error = "Tidak ada sinyal highlight yang cukup: video ini " +
                         "tidak punya heatmap, transkrip, maupun audio yang " +
