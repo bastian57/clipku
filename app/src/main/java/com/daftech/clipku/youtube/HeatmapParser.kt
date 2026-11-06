@@ -17,9 +17,15 @@ import org.json.JSONObject
  * semua detik, dan bobotnya didistribusikan ulang ke sinyal yang ada.
  */
 object HeatmapParser {
-    fun parse(root: JSONObject): List<HeatPoint> {
+    /**
+     * v1.0.8 P0-3: parse butuh durasi video untuk mengubah
+     * timeRangeStartMillis (ms absolut) menjadi fraksi 0..1. Tanpa
+     * durasi, marker objek tidak bisa dipakai dan hanya jalur array
+     * angka yang hidup.
+     */
+    fun parse(root: JSONObject, durationMs: Long = 0L): List<HeatPoint> {
         val found = mutableListOf<HeatPoint>()
-        scan(root, found)
+        scan(root, found, durationMs)
         // Normalisasi + urutkan + buang duplikat fraksi.
         return found
             .filter { it.fraction in 0.0..1.0 && it.intensity in 0.0..1.0 }
@@ -27,7 +33,7 @@ object HeatmapParser {
             .distinctBy { (it.fraction * 1000).toInt() }
     }
 
-    private fun scan(value: Any?, out: MutableList<HeatPoint>) {
+    private fun scan(value: Any?, out: MutableList<HeatPoint>, durationMs: Long) {
         when (value) {
             is JSONObject -> {
                 val keys = value.keys()
@@ -39,13 +45,13 @@ object HeatmapParser {
                     }
                     // Penanda klasik: heatMarkers / markers dengan decoration / intensity.
                     if ((key == "heatMarkers" || key == "markers") && child is JSONArray) {
-                        parseMarkers(child, out)
+                        parseMarkers(child, out, durationMs)
                     }
-                    scan(child, out)
+                    scan(child, out, durationMs)
                 }
             }
             is JSONArray -> {
-                for (i in 0 until value.length()) scan(value.opt(i), out)
+                for (i in 0 until value.length()) scan(value.opt(i), out, durationMs)
             }
             else -> Unit
         }
@@ -67,19 +73,58 @@ object HeatmapParser {
         }
     }
 
-    private fun parseMarkers(array: JSONArray, out: MutableList<HeatPoint>) {
+    /**
+     * v1.0.8 P0-3 — format ASLI YouTube: array OBJEK heatMarkers,
+     * tiap objek membawa timeRangeStartMillis (ms absolut) +
+     * heatMarkerIntensity (0..1). Bentuk yang ditangani, semuanya
+     * best-effort:
+     *  - {"timeRangeStartMillis": 12345, "heatMarkerIntensity": 0.8}
+     *  - {"heatMarkerRenderer": {"timeRangeStartMillis": ..., ...}}
+     *  - timeRangeStartMillis sebagai angka, string angka, atau objek
+     *    {"value": ...} / {"simpleText": "..."}; intensitas sebagai
+     *    angka, string, atau objek {"value": ...}.
+     * Dulu parseMarkers menyimpan fraksi -1.0 yang lalu dibuang
+     * parse() — jalur markers SELALU mati. Sekarang fraksi dihitung
+     * dari durasi video; tanpa durasi (>0) marker dilewati.
+     */
+    private fun parseMarkers(
+        array: JSONArray,
+        out: MutableList<HeatPoint>,
+        durationMs: Long
+    ) {
+        if (durationMs <= 0L) return
         for (i in 0 until array.length()) {
             val item = array.optJSONObject(i) ?: continue
-            val timeRange = item.optJSONObject("timeRangeStartMillis")
-            val startMs = timeRange?.optLong("value", -1L) ?: -1L
-            val intensity = item.optDouble("heatMarkerIntensity", -1.0)
-            // Tanpa durasi total di node ini, fraksi tidak bisa dihitung di sini;
-            // node seperti ini diabaikan — parseHeatArray adalah jalur utama.
+            val node = item.optJSONObject("heatMarkerRenderer") ?: item
+            val startMs = readMillis(node, "timeRangeStartMillis")
+            val intensity = readDouble(node, "heatMarkerIntensity")
             if (startMs >= 0 && intensity in 0.0..1.0) {
-                // Disimpan sebagai intensitas mentah dengan fraksi -1 agar
-                // tidak dipakai diam-diam; scoring mengabaikan fraksi < 0.
-                out.add(HeatPoint(-1.0, intensity))
+                val fraction = startMs.toDouble() / durationMs.toDouble()
+                if (fraction in 0.0..1.0) {
+                    out.add(HeatPoint(fraction, intensity))
+                }
             }
+        }
+    }
+
+    /** Baca ms dari angka / string angka / objek {"value"|"simpleText"}. -1 kalau tidak ada. */
+    private fun readMillis(obj: JSONObject, key: String): Long {
+        return when (val v = obj.opt(key)) {
+            is Number -> v.toLong()
+            is String -> v.trim().toLongOrNull() ?: -1L
+            is JSONObject -> v.optLong("value", -1L).takeIf { it >= 0 }
+                ?: v.optString("simpleText", "").trim().toLongOrNull() ?: -1L
+            else -> -1L
+        }
+    }
+
+    /** Baca double dari angka / string / objek {"value"}. -1.0 kalau tidak ada. */
+    private fun readDouble(obj: JSONObject, key: String): Double {
+        return when (val v = obj.opt(key)) {
+            is Number -> v.toDouble()
+            is String -> v.trim().toDoubleOrNull() ?: -1.0
+            is JSONObject -> v.optDouble("value", -1.0)
+            else -> -1.0
         }
     }
 }

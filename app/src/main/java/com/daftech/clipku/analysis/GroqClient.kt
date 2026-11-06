@@ -69,7 +69,30 @@ class GroqClient(
         const val WINDOW_OVERLAP_MS = 90_000L
         /** Batas keras teks per call scoring (segmen sudah dipotong 1200 char di pemanggil). */
         const val MAX_CHARS_PER_CALL = 12_000
+        // v1.0.8 P0-2 — pacing anggaran Groq free tier (8.000 token
+        // input/menit): 9 window x ~2.600 token ≈ 23.400 token.
+        // Tanpa jeda, 23.400 token terkirim dalam ±30-45 detik dan
+        // window akhir kena 429. Dengan jeda 12 detik antar window
+        // (8 jeda = 96 detik) + waktu call sendiri (~5-10 detik x 9),
+        // total analisa ≈ 2,5-3 menit → laju rata-rata ≈ 23.400 /
+        // 180 detik ≈ 7.800 token/menit, di bawah batas 8.000.
+        // Ini lantai, bukan jaminan: kalau call-nya sangat cepat,
+        // jeda inilah yang menahan laju; kalau Groq lambat, total
+        // waktu bertambah sendiri. Analisa video panjang JADI LEBIH
+        // LAMBAT karena ini — disengaja, bukan bug.
+        const val WINDOW_DELAY_MS = 12_000L
+        // v1.0.8 P0-2 — backoff 429 antar model di callChat: 2 detik
+        // sebelum model ke-2, 4 detik sebelum model ke-3.
+        const val RETRY_429_BASE_MS = 2_000L
     }
+
+    /**
+     * v1.0.8 P0-7 — pengecualian khusus: LLM menjawab tapi tidak
+     * men-skor satu pun segmen (jawaban tidak ter-parse sebagai
+     * JSON skor). Beda dari gagal HTTP: ini "sukses palsu" yang
+     * dulu dihitung sebagai jendela berhasil.
+     */
+    class EmptyLlmScoreException(message: String) : IllegalStateException(message)
 
     // Kegagalan terakhir postOnce, untuk pesan error callChat.
     // TIDAK PERNAH berisi API key: hanya HTTP + pesan error Groq.
@@ -141,19 +164,32 @@ class GroqClient(
             windowsTotal++
             try {
                 val windowScores = scoreSegments(apiKey, videoTitle, windowSegments)
-                for ((id, score) in windowScores) {
-                    val existing = merged[id]
-                    if (existing == null || score.score > existing.score) {
-                        merged[id] = score
+                // v1.0.8 P0-7: jendela dihitung BERHASIL hanya kalau
+                // LLM benar-benar men-skor >=1 segmen. Map kosong
+                // (scoreSegments melempar EmptyLlmScoreException)
+                // dihitung GAGAL, bukan sukses palsu.
+                if (windowScores.isEmpty()) {
+                    windowsFailed++
+                    lastError = "jendela ${windowsTotal}: LLM tidak men-skor satu pun segmen"
+                } else {
+                    for ((id, score) in windowScores) {
+                        val existing = merged[id]
+                        if (existing == null || score.score > existing.score) {
+                            merged[id] = score
+                        }
                     }
+                    windowsSucceeded++
                 }
-                windowsSucceeded++
             } catch (e: Exception) {
                 windowsFailed++
                 lastError = e.message?.take(200)
             }
             if (fromIndex + segmentsPerWindow >= segments.size) break
             fromIndex += step
+            // v1.0.8 P0-2 — jeda antar jendela (pacing TPM, lihat
+            // konstanta WINDOW_DELAY_MS). Jeda sesudah tiap jendela
+            // kecuali yang terakhir.
+            kotlinx.coroutines.delay(WINDOW_DELAY_MS)
         }
         ChunkedScoreResult(merged, windowsTotal, windowsSucceeded, windowsFailed, lastError)
     }
@@ -255,7 +291,17 @@ class GroqClient(
         """.trimIndent()
         val userPrompt = "Judul video: $videoTitle\n\nSegmen:\n$segmentText"
         val raw = callChat(apiKey, systemPrompt, userPrompt)
-        parseScores(raw)
+        val parsed = parseScores(raw)
+        // v1.0.8 P0-7: jawaban LLM yang tidak ter-parse menjadi skor
+        // apa pun adalah KEGAGALAN window ini, bukan "sukses 0 skor".
+        // Pemanggil (scoreSegmentsChunked) menghitungnya gagal dan
+        // lanjut ke window lain — bukan diam-diam menghitung sukses.
+        if (parsed.isEmpty()) {
+            throw EmptyLlmScoreException(
+                "LLM tidak men-skor satu pun segmen (jawaban tidak ter-parse sebagai JSON skor)."
+            )
+        }
+        parsed
     }
 
     data class SegmentInput(
@@ -302,8 +348,15 @@ class GroqClient(
         // v1.0.4: coba model berurutan, pertama yang berhasil menang.
         // Signature fungsi ini TIDAK berubah: pemanggil lama (scoring dan
         // narasi) tetap menerima String atau IllegalStateException.
+        // v1.0.8 P0-2:
+        //  - Fail-fast 413: prompt terlalu besar akan gagal di KETIGA
+        //    model dengan prompt yang sama — buang waktu dan memperparah
+        //    rate limit. Begitu satu model menjawab 413, berhenti.
+        //  - Backoff 429: jeda eksponensial singkat sebelum mencoba
+        //    model berikutnya (2 detik, lalu 4 detik), bukan retry
+        //    langsung yang memperburuk limit.
         lastError = null
-        for (model in MODELS) {
+        for ((index, model) in MODELS.withIndex()) {
             val body = JSONObject().apply {
                 put("model", model)
                 put("temperature", 0.4)
@@ -318,6 +371,16 @@ class GroqClient(
             }
             val result = postOnce(apiKey, body, model)
             if (result != null) return result
+            val err = lastError ?: ""
+            if (err.startsWith("HTTP 413")) break
+            if (err.startsWith("HTTP 429") && index < MODELS.lastIndex) {
+                try {
+                    Thread.sleep(RETRY_429_BASE_MS * (index + 1))
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    break
+                }
+            }
         }
         val detail = lastError?.take(200) ?: "tanpa detail"
         throw IllegalStateException(

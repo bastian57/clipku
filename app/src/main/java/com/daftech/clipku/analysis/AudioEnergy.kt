@@ -30,7 +30,14 @@ data class AudioAnalysisResult(
     val downloadedBytes: Long,
     val mime: String,
     val error: String?,
-    val streamsTried: Int
+    val streamsTried: Int,
+    /**
+     * v1.0.8 P0-4: true kalau kegagalan terakhir adalah DNS
+     * (UnknownHostException) — bedakan dari HTTP/expired/decode.
+     * failedHost = host googlevideo yang gagal di-resolve.
+     */
+    val dnsFailure: Boolean = false,
+    val failedHost: String? = null
 )
 
 private data class DecodeOutcome(
@@ -57,6 +64,14 @@ object AudioEnergy {
      * Coba stream audio berurutan: yang pertama decode-nya kosong
      * langsung dilanjutkan ke stream berikutnya, sampai satu berhasil
      * atau daftar habis. Yang pertama berhasil langsung dipakai.
+     *
+     * v1.0.8 P0-4 — diversifikasi host DULU: semua URL audio NewPipe
+     * untuk satu video biasanya menunjuk ke SATU host googlevideo
+     * yang sama, jadi satu UnknownHostException menggagalkan ke-35
+     * percobaan dengan error yang sama. Urutan coba sekarang: satu
+     * URL per host yang berbeda dulu (NewPipe vs Innertube), baru
+     * sisanya berurutan. Satu host yang mati tidak lagi membunuh
+     * seluruh daftar sebelum host lain dicoba.
      */
     suspend fun analyseMultiple(
         audioUrls: List<String>,
@@ -66,7 +81,9 @@ object AudioEnergy {
             .readTimeout(60, TimeUnit.SECONDS)
             .build()
     ): AudioAnalysisResult = withContext(Dispatchers.IO) {
-        val urls = audioUrls.filter { it.isNotEmpty() }.distinct()
+        val urls = diversifyByHost(
+            audioUrls.filter { it.isNotEmpty() }.distinct()
+        )
         if (urls.isEmpty()) {
             return@withContext AudioAnalysisResult(
                 emptyMap(), 0, 0, "", "tanpa URL audio", 0
@@ -83,6 +100,45 @@ object AudioEnergy {
             last = result
         }
         last.copy(streamsTried = tried)
+    }
+
+    /**
+     * v1.0.8 P0-4: urutkan URL supaya satu URL per host yang berbeda
+     * dicoba dulu (giliran pertama), baru URL sisa dari host yang
+     * sudah dicoba (giliran kedua). Host diambil dari URL; kalau
+     * tidak ter-parse, URL itu dianggap host-nya sendiri.
+     */
+    private fun diversifyByHost(urls: List<String>): List<String> {
+        val seenHosts = linkedSetOf<String>()
+        val firstPerHost = mutableListOf<String>()
+        val rest = mutableListOf<String>()
+        for (url in urls) {
+            val host = hostOf(url)
+            if (seenHosts.add(host)) {
+                firstPerHost.add(url)
+            } else {
+                rest.add(url)
+            }
+        }
+        return firstPerHost + rest
+    }
+
+    private fun hostOf(url: String): String {
+        return try {
+            java.net.URL(url).host.lowercase()
+        } catch (e: Exception) {
+            url
+        }
+    }
+
+    /** Cari UnknownHostException di rantai penyebab exception. */
+    private fun findUnknownHost(e: Throwable?): Boolean {
+        var t = e
+        while (t != null) {
+            if (t is java.net.UnknownHostException) return true
+            t = t.cause
+        }
+        return false
     }
 
     private suspend fun analyseOne(
@@ -142,10 +198,22 @@ object AudioEnergy {
                 outcome.error, 0
             )
         } catch (e: Exception) {
-            AudioAnalysisResult(
-                emptyMap(), 0, 0, "",
-                (e.message ?: "gagal unduh/decode").take(80), 0
-            )
+            // v1.0.8 P0-4: bedakan DNS dari kegagalan lain — host yang
+            // gagal di-resolve dicatat supaya diagnostik bisa menulis
+            // "host X gagal resolve (DNS)", bukan pesan exception mentah.
+            if (findUnknownHost(e)) {
+                val host = hostOf(audioUrl)
+                AudioAnalysisResult(
+                    emptyMap(), 0, 0, "",
+                    "host $host gagal resolve (DNS)", 0,
+                    dnsFailure = true, failedHost = host
+                )
+            } else {
+                AudioAnalysisResult(
+                    emptyMap(), 0, 0, "",
+                    (e.message ?: "gagal unduh/decode").take(80), 0
+                )
+            }
         } finally {
             try { tmp?.delete() } catch (e: Exception) { /* abaikan */ }
         }

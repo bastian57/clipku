@@ -1,7 +1,7 @@
-# ClipKu v1.0.7 — Highlight Clip dari Video Panjang
+# ClipKu v1.0.8 — Highlight Clip dari Video Panjang
 
 APK Android (Kotlin native + Jetpack Compose Material3, dark premium).
-Package: `com.daftech.clipku` • versionCode 8 / versionName 1.0.7 •
+Package: `com.daftech.clipku` • versionCode 9 / versionName 1.0.8 •
 minSdk 24, targetSdk 34, compileSdk 34.
 
 ## Scope v1 (locked, gas 2026-11-04 14:30 WIB)
@@ -44,6 +44,17 @@ minSdk 24, targetSdk 34, compileSdk 34.
   quotable / story peak / practical value; dedupe overlap >50% +
   SATU rerank komparatif atas kandidat final; jendela gagal di-skip,
   bukan menolkan video. Diagnostik: "jendela LLM: X/Y berhasil".
+  v1.0.8: SEMUA 7 temuan P0 audit penuh — fallback transcript-only
+  (transkrip saja bisa menghasilkan clip saat LLM mati, ditandai
+  "transkrip saja (tanpa skor LLM)"); pesan penolakan jujur dibangun
+  dari sinyal yang benar-benar nol; pacing Groq (jeda 12 detik antar
+  jendela, fail-fast 413, backoff 429); parser heatmap membaca format
+  asli YouTube (heatMarkers objek) + tail heatmap meluruh 60 detik;
+  audio diversifikasi per host + URL Innertube ikut dicoba + 1x
+  re-extract/retry saat DNS gagal; cache sumber divalidasi isinya
+  (MediaExtractor >=1 track) dan file parsial dihapus saat download
+  gagal; MediaStore hanya sukses setelah byte benar-benar tertulis;
+  jendela LLM dihitung berhasil hanya kalau >=1 segmen ter-skor.
   yt-dlp-android hanya fallback terdokumentasi.
 - Scoring: heatmap Most Replayed (best-effort) + transkrip VTT +
   skor LLM Groq + energi audio RMS per detik. Merge puncak dekat,
@@ -58,7 +69,7 @@ minSdk 24, targetSdk 34, compileSdk 34.
 Build resmi via GitHub Actions (lihat `.github/workflows/clipku-build.yml`):
 JDK 17 + Android SDK manual + Gradle 8.7 + `gradle assembleDebug`,
 gerbang keystore + gerbang sertifikat APK sebelum upload ke rolling
-release `latest`, nama file `ClipKu-v1.0.7.apk`, plus `build.log` ke
+release `latest`, nama file `ClipKu-v1.0.8.apk`, plus `build.log` ke
 release `build-log` (if: always).
 
 Build lokal (opsional): Gradle 8.7+, JDK 17, Android SDK 34, lalu

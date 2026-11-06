@@ -196,7 +196,8 @@ class InnertubeClient(
         }
 
         val captions = parseCaptions(root)
-        val heat = HeatmapParser.parse(root)
+        // v1.0.8 P0-3: heatmap butuh durasi untuk fraksi marker.
+        val heat = HeatmapParser.parse(root, durationMs)
         val streaming = root.optJSONObject("streamingData") ?: JSONObject()
         val progressive = pickProgressive(streaming.optJSONArray("formats"))
         val adaptiveVideo = pickAdaptiveVideo(streaming.optJSONArray("adaptiveFormats"))

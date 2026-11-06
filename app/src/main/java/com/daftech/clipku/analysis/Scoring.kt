@@ -32,6 +32,8 @@ object Scoring {
     const val MIN_MS = 50_000L
     const val MAX_MS = 70_000L
     const val MIN_PEAK_GAP_MS = 75_000L
+    /** v1.0.8 P0-3: ekor heatmap meluruh ke 0 dalam 60 detik setelah titik terakhir. */
+    const val TAIL_DECAY_SECONDS = 60.0
 
     data class AnalysisInput(
         val durationMs: Long,
@@ -105,20 +107,36 @@ object Scoring {
         var llmWeight = if (hasLlm) 0.35 else 0.0
         var audioWeight = if (hasAudio) 0.20 else 0.0
         val totalWeight = heatWeight + llmWeight + audioWeight
+        // v1.0.8 P0-1 — fallback transcript-only: kalau LLM gagal total
+        // (mis. 413 di ALI) DAN heatmap + audio juga 0, transkrip yang
+        // ADA tetap bisa menghasilkan clip — bukan dari tebakan, tapi
+        // dari sinyal teks yang sudah ada di transkrip itu sendiri
+        // (lihat transcriptTextPerSecond). Clip hasil jalur ini
+        // DITANDAI "transkrip saja (tanpa skor LLM)" di alasannya dan
+        // TIDAK PERNAH diklaim sebagai clip ber-skor LLM.
+        val transcriptOnly: Boolean
+        val perSecond: DoubleArray
         if (totalWeight <= 0.0) {
-            // Tidak ada sinyal sama sekali: kembalikan clip kosong dengan
-            // alasan jelas di ViewModel (bukan clip ngarang dari detik 0).
-            return emptyList()
-        }
-        heatWeight /= totalWeight
-        llmWeight /= totalWeight
-        audioWeight /= totalWeight
-
-        val perSecond = DoubleArray(durationSec) { second ->
-            val heat = heatPerSecond.getOrElse(second) { 0.0 }
-            val llm = llmPerSecond.getOrElse(second) { 0.0 }
-            val audio = input.audioBySecond[second] ?: 0.0
-            heatWeight * heat + llmWeight * llm + audioWeight * audio
+            if (input.sentences.isEmpty()) {
+                // Tidak ada sinyal sama sekali dan tidak ada transkrip:
+                // kembalikan clip kosong dengan alasan jelas di
+                // ViewModel (bukan clip ngarang dari detik 0).
+                return emptyList()
+            }
+            transcriptOnly = true
+            perSecond = transcriptTextPerSecond(input.sentences, durationSec)
+            if (perSecond.none { it > 0.0 }) return emptyList()
+        } else {
+            transcriptOnly = false
+            heatWeight /= totalWeight
+            llmWeight /= totalWeight
+            audioWeight /= totalWeight
+            perSecond = DoubleArray(durationSec) { second ->
+                val heat = heatPerSecond.getOrElse(second) { 0.0 }
+                val llm = llmPerSecond.getOrElse(second) { 0.0 }
+                val audio = input.audioBySecond[second] ?: 0.0
+                heatWeight * heat + llmWeight * llm + audioWeight * audio
+            }
         }
         // Haluskan 15 detik (rata-rata bergerak) supaya puncak tidak berisik.
         val smoothed = DoubleArray(durationSec) { second ->
@@ -166,6 +184,9 @@ object Scoring {
             val title = llm?.title?.takeIf { it.isNotBlank() }
                 ?: segment?.text?.take(60)?.trim().orEmpty().ifEmpty { videoTitle }
             val reasonParts = mutableListOf<String>()
+            // v1.0.8 P0-1: clip jalur transcript-only DITANDAI — user
+            // harus bisa membedakannya dari clip ber-skor LLM.
+            if (transcriptOnly) reasonParts.add("transkrip saja (tanpa skor LLM)")
             if (hasHeat) reasonParts.add("paling di-rewatch")
             if (llm != null && llm.reason.isNotBlank()) reasonParts.add(llm.reason)
             if (hasAudio) reasonParts.add("energi audio tinggi")
@@ -181,6 +202,41 @@ object Scoring {
         }
     }
 
+    /**
+     * v1.0.8 P0-1 — skor teks transkrip saja (fallback saat LLM mati
+     * DAN heatmap + audio 0). Aturan, didokumentasikan eksplisit:
+     * tiap kalimat men-skor rentang detiknya dengan nilai dasar 0.50,
+     * +0.20 kalau mengandung '?' (kalimat tanya — momen penekanan /
+     * pertanyaan retoris), +0.20 kalau mengandung '!' (seruan),
+     * +0.10 kalau panjangnya 12-40 kata (kalimat substansial, bukan
+     * filler satu-dua kata). Nilai dijepit 0.0-1.0, detik yang
+     * tercakup beberapa kalimat mengambil nilai tertinggi. Ini BUKAN
+     * penilaian semantik LLM — hanya sinyal teks kasar supaya video
+     * yang transkripnya ada tidak pulang dengan tangan kosong saat
+     * Groq tidak menjawab. Kualitasnya belum terbukti di HP.
+     */
+    private fun transcriptTextPerSecond(
+        sentences: List<Sentence>,
+        durationSec: Int
+    ): DoubleArray {
+        val out = DoubleArray(durationSec) { 0.0 }
+        for (sentence in sentences) {
+            var score = 0.50
+            if ('?' in sentence.text) score += 0.20
+            if ('!' in sentence.text) score += 0.20
+            val words = sentence.text.trim().split(Regex("\\s+"))
+                .count { it.isNotEmpty() }
+            if (words in 12..40) score += 0.10
+            score = score.coerceIn(0.0, 1.0)
+            val from = (sentence.startMs / 1000).toInt().coerceIn(0, durationSec - 1)
+            val to = (sentence.endMs / 1000).toInt().coerceIn(0, durationSec - 1)
+            for (second in from..to) {
+                if (score > out[second]) out[second] = score
+            }
+        }
+        return out
+    }
+
     private fun heatPerSecond(points: List<HeatPoint>, durationMs: Long): DoubleArray {
         val seconds = max(1, (durationMs / 1000).toInt())
         val out = DoubleArray(seconds) { 0.0 }
@@ -191,6 +247,13 @@ object Scoring {
             if (point.intensity > out[second]) out[second] = point.intensity
         }
         // Isi celah dengan interpolasi linear sederhana antar titik terisi.
+        // v1.0.8 P0-3 — tail-fill DIBATASI: setelah titik heatmap
+        // TERAKHIR, nilai tidak lagi diisi lastValue * 0.5 selamanya
+        // (itu membuat ekor video ter-skor tinggi secara palsu).
+        // Di luar titik terakhir, nilai meluruh linear dari 0.5x ke 0
+        // dalam TAIL_DECAY_SECONDS = 60 detik, lalu 0. Celah ANTAR
+        // titik tetap diisi flat 0.5x seperti dulu.
+        val lastPointSecond = (0 until seconds).lastOrNull { out[it] > 0.0 } ?: -1
         var lastFilled = -1
         var lastValue = 0.0
         for (second in 0 until seconds) {
@@ -198,7 +261,13 @@ object Scoring {
                 lastFilled = second
                 lastValue = out[second]
             } else if (lastFilled >= 0) {
-                out[second] = lastValue * 0.5
+                if (second > lastPointSecond) {
+                    val elapsed = (second - lastPointSecond).toDouble()
+                    val decay = 0.5 * (1.0 - elapsed / TAIL_DECAY_SECONDS)
+                    out[second] = if (decay > 0.0) lastValue * decay else 0.0
+                } else {
+                    out[second] = lastValue * 0.5
+                }
             }
         }
         return out

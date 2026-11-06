@@ -165,6 +165,11 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                 var streamSource = innertube.lastStreamSource
                 var subtitlesFromNewPipe = false
                 // v1.0.3: daftar URL audio untuk fallback berurutan.
+                // v1.0.8 P0-4: simpan audioUrl Innertube ASLI sebelum
+                // merge NewPipe — begitu NewPipe memberi audio, URL
+                // Innertube tertimpa di info.stream dan tidak pernah
+                // dicoba lagi (host-nya bisa berbeda dari host NewPipe).
+                val innertubeAudioUrl = info.stream.audioUrl
                 var audioUrls: List<String> = listOfNotNull(info.stream.audioUrl)
                 status = "Mencari stream via NewPipe…"
                 try {
@@ -207,9 +212,17 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                         )
                         if (newPipe.audioUrl != null) {
                             streamSource = "NEWPIPE"
-                            audioUrls = newPipe.audioUrls.ifEmpty {
-                                listOfNotNull(newPipe.audioUrl)
-                            }
+                            // v1.0.8 P0-4: URL Innertube TETAP masuk
+                            // daftar coba (di belakang URL NewPipe,
+                            // tanpa duplikat) — AudioEnergy mencoba
+                            // satu URL per host dulu, jadi host
+                            // Innertube yang berbeda tidak lagi
+                            // terkubur oleh 35 URL satu host NewPipe.
+                            audioUrls = (
+                                newPipe.audioUrls.ifEmpty {
+                                    listOfNotNull(newPipe.audioUrl)
+                                } + listOfNotNull(innertubeAudioUrl)
+                                ).distinct()
                         }
                         if (info.captionTracks.isEmpty() && newPipe.subtitles.isNotEmpty()) {
                             info = info.copy(captionTracks = newPipe.subtitles)
@@ -238,10 +251,47 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                 }
                 status = "Menganalisa audio…"
                 // v1.0.3: coba stream audio berurutan + bawa jejak tahapnya.
-                val audioResult = AudioEnergy.analyseMultiple(
+                // v1.0.8 P0-4: kalau kegagalan terakhir adalah DNS
+                // (UnknownHostException), lakukan SATU re-extract fresh
+                // NewPipe + SATU percobaan ulang dengan URL baru — URL
+                // googlevideo hasil extract lama bisa menunjuk host yang
+                // sudah tidak bisa di-resolve, sementara extract baru
+                // memberi host lain. Satu retry saja, bukan loop.
+                var audioResult = AudioEnergy.analyseMultiple(
                     audioUrls,
                     getApplication<Application>().cacheDir
                 )
+                var audioDnsRetried = false
+                if (audioResult.dnsFailure && audioResult.bySecond.isEmpty()) {
+                    try {
+                        val retryPreferred = if (info.captionTracks.any {
+                                it.languageCode.startsWith("id")
+                            }
+                        ) {
+                            "id"
+                        } else {
+                            info.captionTracks.firstOrNull()?.languageCode
+                                ?.take(2)?.lowercase()
+                        }
+                        val fresh = NewPipeStreamExtractor.extract(
+                            videoId, retryPreferred
+                        )
+                        val retryUrls = (
+                            fresh.audioUrls.ifEmpty {
+                                listOfNotNull(fresh.audioUrl)
+                            } + listOfNotNull(innertubeAudioUrl)
+                            ).distinct()
+                        if (retryUrls.isNotEmpty()) {
+                            audioDnsRetried = true
+                            audioResult = AudioEnergy.analyseMultiple(
+                                retryUrls,
+                                getApplication<Application>().cacheDir
+                            )
+                        }
+                    } catch (e: Exception) {
+                        // Re-extract gagal = pakai hasil pertama, bukan crash.
+                    }
+                }
                 val audio = audioResult.bySecond
                 val tracksTried = innertube.lastTracksTried
                 val segments = Scoring.buildSegments(sentences)
@@ -358,6 +408,15 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                 } else {
                     ""
                 }
+                // v1.0.8 P0-4: tandai kegagalan DNS secara eksplisit di
+                // diagnostik (termasuk apakah sudah dicoba ulang sekali).
+                val audioDnsText = if (audioResult.dnsFailure) {
+                    " • audio DNS: host " + (audioResult.failedHost ?: "?") +
+                        " gagal resolve (DNS)" +
+                        if (audioDnsRetried) " — sudah dicoba ulang 1x" else ""
+                } else {
+                    ""
+                }
                 diagnostic = "Diagnostik: judul terambil • durasi " +
                     durationMinutes + " menit • track caption: " +
                     info.captionTracks.size + " • transkrip: " +
@@ -382,15 +441,42 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                     audioResult.httpCode + " • audio byte: " +
                     audioResult.downloadedBytes + " • audio mime: " +
                     audioResult.mime.ifEmpty { "-" } + " • stream dicoba: " +
-                    audioResult.streamsTried + audioErrorText + " • Groq key: " +
+                    audioResult.streamsTried + audioErrorText + audioDnsText +
+                    " • Groq key: " +
                     groqKeyText + " • skor LLM: " + llmScores.size + " segmen" +
                     (if (llmError != null) " (gagal: " + llmError + ")" else "") +
                     // v1.0.7: berapa jendela scoring yang berhasil/gagal.
                     llmWindowsText + zeroText
                 if (found.isEmpty()) {
-                    error = "Tidak ada sinyal highlight yang cukup: video ini " +
-                        "tidak punya heatmap, transkrip, maupun audio yang " +
-                        "bisa dianalisa. Clip tidak dibuat-buat dari tebakan."
+                    // v1.0.8 P0-1: pesan penolakan dibangun dari sinyal
+                    // yang BENAR-BENAR nol — bukan blanket "tidak punya
+                    // heatmap, transkrip, maupun audio" yang berbohong
+                    // saat transkrip 1103 kalimat ADA (kasus ALI).
+                    val refusalParts = mutableListOf<String>()
+                    if (sentences.isEmpty()) {
+                        refusalParts.add("transkrip tidak ada")
+                    } else {
+                        refusalParts.add(
+                            "transkrip ada ${sentences.size} kalimat"
+                        )
+                    }
+                    if (key.isBlank()) {
+                        refusalParts.add("Groq key kosong")
+                    } else if (llmError != null) {
+                        refusalParts.add("skor LLM gagal ($llmError)")
+                    } else if (llmScores.isEmpty()) {
+                        refusalParts.add("skor LLM 0 segmen")
+                    }
+                    if (audio.isEmpty()) {
+                        refusalParts.add("audio 0 detik ter-decode")
+                    }
+                    if (info.heatPoints.isEmpty()) {
+                        refusalParts.add("heatmap 0 titik")
+                    }
+                    error = "Tidak ada sinyal highlight yang cukup: " +
+                        refusalParts.joinToString(", ") +
+                        " — tidak ada sinyal yang cukup untuk membuat " +
+                        "clip. Clip tidak dibuat-buat dari tebakan."
                     status = ""
                 } else {
                     clips = found

@@ -102,6 +102,36 @@ object ClipDownload {
         }
     }
 
+    /**
+     * v1.0.8 P0-5 — validasi file sumber cache sebelum dipakai ulang.
+     * Cek nama/length saja TIDAK cukup: file parsial dari download
+     * yang gagal di tengah (exception saat copy) panjangnya >0 dan
+     * lolos sebagai "sumber valid", lalu CuttingEngine memotong file
+     * rusak itu dan percobaan ulang tetap gagal. Valid = panjang >0
+     * DAN MediaExtractor bisa membukanya dengan >=1 track. File yang
+     * tidak valid DIHAPUS supaya download berikutnya mengunduh ulang
+     * dari nol — gagal download tidak boleh meracuni percobaan
+     * berikutnya.
+     */
+    private fun isValidCachedSource(file: File): Boolean {
+        if (!file.exists() || file.length() <= 0L) return false
+        val extractor = android.media.MediaExtractor()
+        return try {
+            extractor.setDataSource(file.absolutePath)
+            extractor.trackCount > 0
+        } catch (e: Exception) {
+            false
+        } finally {
+            try { extractor.release() } catch (e: Exception) { /* abaikan */ }
+        }
+    }
+
+    private fun deleteIfInvalidCachedSource(file: File) {
+        if (!isValidCachedSource(file)) {
+            try { file.delete() } catch (e: Exception) { /* abaikan */ }
+        }
+    }
+
     /** Unduh stream ke [target]. Mengembalikan true kalau file valid. */
     suspend fun downloadToFile(url: String, target: File): Boolean =
         withContext(Dispatchers.IO) {
@@ -109,13 +139,29 @@ object ClipDownload {
                 if (target.exists()) target.delete()
                 val request = Request.Builder().url(url).build()
                 val response = http.newCall(request).execute()
-                if (!response.isSuccessful) return@withContext false
+                if (!response.isSuccessful) {
+                    response.close()
+                    // v1.0.8 P0-5: gagal HTTP = target dihapus, jangan
+                    // tinggalkan file kosong/parsial untuk dipakai ulang.
+                    try { target.delete() } catch (e: Exception) { /* abaikan */ }
+                    return@withContext false
+                }
                 target.outputStream().use { out ->
                     response.body?.byteStream()?.copyTo(out)
                 }
                 response.close()
-                target.exists() && target.length() > 0
+                // v1.0.8 P0-5: sukses tapi 0 byte = file tidak valid,
+                // hapus supaya tidak dianggap sumber cache yang sah.
+                if (!target.exists() || target.length() <= 0L) {
+                    try { target.delete() } catch (e: Exception) { /* abaikan */ }
+                    return@withContext false
+                }
+                true
             } catch (e: Exception) {
+                // v1.0.8 P0-5: exception di tengah copy (jaringan
+                // putus, disk penuh) = file parsial DIHAPUS, bukan
+                // dibiarkan untuk dipakai ulang sebagai "sumber".
+                try { target.delete() } catch (e2: Exception) { /* abaikan */ }
                 false
             }
         }
@@ -172,9 +218,12 @@ object ClipDownload {
         // v1.0.6 LAPIS 2 — jalur download-penuh v1.0.5, TIDAK DIUBAH.
         // Satu-satunya jalan keluar yang tersisa; kalau ini pun gagal,
         // error dilempar seperti dulu.
+        // v1.0.8 P0-5: cache sumber divalidasi ISINYA (MediaExtractor
+        // >=1 track), bukan cuma exists()+length — file parsial dari
+        // download gagal tidak lagi dipakai ulang.
         val ok = if (info.stream.progressiveUrl != null) {
             val source = File(cacheDir, "source-${info.videoId}.mp4")
-            if (!source.exists() || source.length() == 0L) {
+            if (!isValidCachedSource(source)) {
                 if (!downloadToFile(info.stream.progressiveUrl, source)) {
                     throw IllegalStateException("Gagal mengunduh video sumber.")
                 }
@@ -183,12 +232,12 @@ object ClipDownload {
         } else if (info.stream.videoOnlyUrl != null && info.stream.audioUrl != null) {
             val videoFile = File(cacheDir, "source-${info.videoId}-video.mp4")
             val audioFile = File(cacheDir, "source-${info.videoId}-audio")
-            if (!videoFile.exists() || videoFile.length() == 0L) {
+            if (!isValidCachedSource(videoFile)) {
                 if (!downloadToFile(info.stream.videoOnlyUrl, videoFile)) {
                     throw IllegalStateException("Gagal mengunduh video sumber.")
                 }
             }
-            if (!audioFile.exists() || audioFile.length() == 0L) {
+            if (!isValidCachedSource(audioFile)) {
                 if (!downloadToFile(info.stream.audioUrl, audioFile)) {
                     throw IllegalStateException("Gagal mengunduh audio sumber.")
                 }
@@ -263,9 +312,10 @@ object ClipDownload {
             return@withContext temp
         }
         try { temp.delete() } catch (e: Exception) { /* abaikan */ }
+        // v1.0.8 P0-5: cache sumber divalidasi isinya (lihat lapis 2).
         val ok = if (info.stream.progressiveUrl != null) {
             val source = File(cacheDir, "source-${info.videoId}.mp4")
-            if (!source.exists() || source.length() == 0L) {
+            if (!isValidCachedSource(source)) {
                 if (!downloadToFile(info.stream.progressiveUrl, source)) {
                     return@withContext null
                 }
@@ -274,12 +324,12 @@ object ClipDownload {
         } else if (info.stream.videoOnlyUrl != null && info.stream.audioUrl != null) {
             val videoFile = File(cacheDir, "source-${info.videoId}-video.mp4")
             val audioFile = File(cacheDir, "source-${info.videoId}-audio")
-            if (!videoFile.exists() || videoFile.length() == 0L) {
+            if (!isValidCachedSource(videoFile)) {
                 if (!downloadToFile(info.stream.videoOnlyUrl, videoFile)) {
                     return@withContext null
                 }
             }
-            if (!audioFile.exists() || audioFile.length() == 0L) {
+            if (!isValidCachedSource(audioFile)) {
                 if (!downloadToFile(info.stream.audioUrl, audioFile)) {
                     return@withContext null
                 }
@@ -296,6 +346,12 @@ object ClipDownload {
 
     private fun saveToDownloads(context: Context, cutFile: File, fileName: String): String {
         // Jalur utama: MediaStore Downloads/ClipKu (API 29+, tanpa izin storage).
+        // v1.0.8 P0-6: sukses HANYA setelah byte benar-benar tertulis.
+        // Kalau openOutputStream(uri) mengembalikan null, atau 0 byte
+        // tertulis, entri MediaStore kosong itu DIHAPUS dan alur jatuh
+        // ke fallback — cutFile TIDAK dihapus dan sukses TIDAK
+        // dikembalikan. Dulu code mengembalikan path sukses walau
+        // filenya kosong/tidak ada.
         try {
             val values = ContentValues().apply {
                 put(MediaStore.Downloads.DISPLAY_NAME, fileName)
@@ -308,11 +364,22 @@ object ClipDownload {
                 MediaStore.Downloads.EXTERNAL_CONTENT_URI, values
             )
             if (uri != null) {
-                context.contentResolver.openOutputStream(uri)?.use { out ->
-                    cutFile.inputStream().copyTo(out)
+                val out = context.contentResolver.openOutputStream(uri)
+                if (out != null) {
+                    var bytesWritten = 0L
+                    out.use { o ->
+                        bytesWritten = cutFile.inputStream().copyTo(o)
+                    }
+                    if (bytesWritten > 0L) {
+                        cutFile.delete()
+                        return "Download/ClipKu/$fileName"
+                    }
                 }
-                cutFile.delete()
-                return "Download/ClipKu/$fileName"
+                // OutputStream null ATAU 0 byte tertulis: hapus entri
+                // kosong, JANGAN hapus cutFile, jatuh ke fallback.
+                try {
+                    context.contentResolver.delete(uri, null, null)
+                } catch (e: Exception) { /* abaikan */ }
             }
         } catch (e: Exception) {
             // Jatuh ke fallback di bawah, bukan crash.
