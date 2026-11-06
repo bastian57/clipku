@@ -71,8 +71,27 @@ object SegmentExport {
         startMs: Long,
         endMs: Long,
         output: File
-    ): Boolean {
-        if (endMs <= startMs) return false
+    ): Boolean = trySegmentClipDetailed(
+        context, progressiveUrl, videoOnlyUrl, audioUrl, startMs, endMs, output
+    ).first
+
+    /**
+     * v1.0.9 — varian trySegmentClip yang mengembalikan alasan gagal
+     * singkat (kedua elemen Pair), supaya kegagalan lapis segmen
+     * tercatat di diagnostik, bukan hilang diam-diam. Alasan TIDAK
+     * pernah memuat URL lengkap — hanya pesan ExportException /
+     * validasi yang dipangkas.
+     */
+    suspend fun trySegmentClipDetailed(
+        context: Context,
+        progressiveUrl: String?,
+        videoOnlyUrl: String?,
+        audioUrl: String?,
+        startMs: Long,
+        endMs: Long,
+        output: File
+    ): Pair<Boolean, String?> {
+        if (endMs <= startMs) return false to "rentang clip tidak valid"
         val items: List<MediaItem> = when {
             !progressiveUrl.isNullOrBlank() -> {
                 listOf(clippedItem(progressiveUrl, startMs, endMs))
@@ -83,20 +102,20 @@ object SegmentExport {
                     clippedItem(audioUrl, startMs, endMs)
                 )
             }
-            else -> return false
+            else -> return false to "tidak ada stream untuk segmen"
         }
         return try {
             val ok = transformRemote(context, items, output)
-            if (!ok) return false
+            if (!ok) return false to "Transformer gagal (tanpa pesan)"
             if (!validateClip(output, endMs - startMs, needVideo = true)) {
                 try { output.delete() } catch (e: Exception) { /* abaikan */ }
-                false
+                false to "output segmen tidak valid"
             } else {
-                true
+                true to null
             }
         } catch (e: Exception) {
             try { output.delete() } catch (e2: Exception) { /* abaikan */ }
-            false
+            false to shortReason(e)
         }
     }
 
@@ -113,24 +132,56 @@ object SegmentExport {
         startMs: Long,
         endMs: Long,
         output: File
-    ): Boolean {
-        if (audioUrl.isNullOrBlank() || endMs <= startMs) return false
+    ): Boolean = trySegmentAudioDetailed(
+        context, audioUrl, startMs, endMs, output
+    ).first
+
+    /** v1.0.9 — varian trySegmentAudio dengan alasan gagal singkat. */
+    suspend fun trySegmentAudioDetailed(
+        context: Context,
+        audioUrl: String?,
+        startMs: Long,
+        endMs: Long,
+        output: File
+    ): Pair<Boolean, String?> {
+        if (audioUrl.isNullOrBlank() || endMs <= startMs) {
+            return false to "tidak ada URL audio untuk segmen"
+        }
         return try {
             val ok = transformRemote(
                 context,
                 listOf(clippedItem(audioUrl, startMs, endMs)),
                 output
             )
-            if (!ok) return false
+            if (!ok) return false to "Transformer gagal (tanpa pesan)"
             if (!validateClip(output, endMs - startMs, needVideo = false)) {
                 try { output.delete() } catch (e: Exception) { /* abaikan */ }
-                false
+                false to "output segmen audio tidak valid"
             } else {
-                true
+                true to null
             }
         } catch (e: Exception) {
             try { output.delete() } catch (e2: Exception) { /* abaikan */ }
-            false
+            false to shortReason(e)
+        }
+    }
+
+    /**
+     * v1.0.9 — pangkas pesan exception jadi alasan singkat untuk
+     * diagnostik. URL TIDAK PERNAH dimasukkan ke pesan (pesan
+     * ExportException bisa memuat URI input) — yang disimpan hanya
+     * potongan awal pesan, atau nama class kalau pesan kosong.
+     */
+    private fun shortReason(e: Exception): String {
+        val raw = (e.message ?: "").trim()
+        val clean = raw
+            .replace(Regex("https?://\\S+"), "<url>")
+            .replace(Regex("\\s+"), " ")
+            .take(120)
+        return if (clean.isBlank()) {
+            e.javaClass.simpleName
+        } else {
+            clean
         }
     }
 

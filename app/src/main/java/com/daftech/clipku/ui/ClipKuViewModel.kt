@@ -523,7 +523,15 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                 // v1.0.6: jalur ekspor yang dipakai dicatat di
                 // diagnostik (segment vs full-download) — bukti
                 // jalurnya terlihat, bukan cuma dirasakan waktunya.
-                val exportNote = " • clip ${clip.index}: ${result.method}"
+                // v1.0.9: kalau lapis segmen gagal lalu full-download
+                // yang menyelamatkan, alasan gagal segmen ikut
+                // dicatat di diagnostik yang sama (format " • ").
+                val exportNote = " • clip ${clip.index}: ${result.method}" +
+                    if (result.segmentFailureReason != null) {
+                        " (segmen gagal: ${result.segmentFailureReason})"
+                    } else {
+                        ""
+                    }
                 diagnostic = if (diagnostic.isBlank()) {
                     "clip ${clip.index}: ${result.method}"
                 } else {
@@ -533,6 +541,16 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
             } catch (e: Exception) {
                 updateClip(clip.index) { it.copy(isDownloading = false) }
                 error = e.message ?: "Download clip gagal."
+                // v1.0.9: alasan download yang gagal ikut masuk
+                // diagnostik (format " • " yang sama), supaya kegagalan
+                // berikutnya terbaca tanpa menebak-nebak dari banner.
+                val reason = e.message ?: "tanpa pesan"
+                val failNote = " • download clip ${clip.index} gagal: $reason"
+                diagnostic = if (diagnostic.isBlank()) {
+                    "download clip ${clip.index} gagal: $reason"
+                } else {
+                    diagnostic + failNote
+                }
             }
         }
     }
