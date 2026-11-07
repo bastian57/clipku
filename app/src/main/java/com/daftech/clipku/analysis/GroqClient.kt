@@ -292,9 +292,105 @@ class GroqClient(
         require(apiKey.isNotBlank()) { "Isi Groq API key di Settings dulu." }
         if (segments.isEmpty()) return@withContext emptyMap()
         val (systemPrompt, userPrompt) = buildScoringPrompts(videoTitle, segments)
-        val body = JSONObject().apply {
+        // v1.3.0 (#2 strict JSON): coba structured output dulu —
+        // Groq menjamin output sesuai skema, kelas kegagalan P0-7
+        // (jawaban tidak ter-parse) hilang. Kalau model/server
+        // menolak strict mode (400/unsupported), SEKALI fallback ke
+        // body biasa — parser lama tetap dipakai, bukan crash.
+        val strictOutcome = postOnceDetailed(
+            apiKey, scoringBody(model, systemPrompt, userPrompt, strict = true), model
+        )
+        val raw = strictOutcome.content ?: run {
+            if (isStrictUnsupported(strictOutcome.error)) {
+                val plainOutcome = postOnceDetailed(
+                    apiKey,
+                    scoringBody(model, systemPrompt, userPrompt, strict = false),
+                    model
+                )
+                plainOutcome.content
+                    ?: throw IllegalStateException(
+                        plainOutcome.error?.take(200)
+                            ?: "Groq gagal menjawab (tanpa detail)."
+                    )
+            } else {
+                throw IllegalStateException(
+                    strictOutcome.error?.take(200)
+                        ?: "Groq gagal menjawab (tanpa detail)."
+                )
+            }
+        }
+        val parsed = parseScores(raw)
+        if (parsed.isEmpty()) {
+            throw EmptyLlmScoreException(
+                "LLM tidak men-skor satu pun segmen (jawaban tidak ter-parse sebagai JSON skor)."
+            )
+        }
+        parsed
+    }
+
+    /**
+     * v1.3.0 (#2): body scoring. strict=true menambah
+     * response_format json_schema (strict) + reasoning_effort=low
+     * (hanya gpt-oss — qwen menolak field ini) + max_completion_tokens
+     * ketat 800 (Groq menagih TPM dari yang dideklarasikan, bukan
+     * yang dipakai — 800 cukup untuk ~8 segmen, tanpa membakar budget).
+     * strict=false = body lama v1.2.0 (fallback).
+     * Prompt, temperatur 0.4, dan format isi JSON TIDAK berubah.
+     */
+    private fun scoringBody(
+        model: String,
+        systemPrompt: String,
+        userPrompt: String,
+        strict: Boolean
+    ): JSONObject {
+        return JSONObject().apply {
             put("model", model)
             put("temperature", 0.4)
+            if (strict) {
+                put("response_format", JSONObject().apply {
+                    put("type", "json_schema")
+                    put("json_schema", JSONObject().apply {
+                        put("name", "clip_scores")
+                        put("strict", true)
+                        put("schema", JSONObject().apply {
+                            put("type", "object")
+                            put("properties", JSONObject().apply {
+                                put("scores", JSONObject().apply {
+                                    put("type", "array")
+                                    put("items", JSONObject().apply {
+                                        put("type", "object")
+                                        put("properties", JSONObject().apply {
+                                            put("id", JSONObject().apply {
+                                                put("type", "integer")
+                                            })
+                                            put("score", JSONObject().apply {
+                                                put("type", "integer")
+                                            })
+                                            put("title", JSONObject().apply {
+                                                put("type", "string")
+                                            })
+                                            put("reason", JSONObject().apply {
+                                                put("type", "string")
+                                            })
+                                        })
+                                        put("required", JSONArray().apply {
+                                            put("id"); put("score")
+                                            put("title"); put("reason")
+                                        })
+                                        put("additionalProperties", false)
+                                    })
+                                })
+                            })
+                            put("required", JSONArray().apply { put("scores") })
+                            put("additionalProperties", false)
+                        })
+                    })
+                })
+                if (model.startsWith("openai/gpt-oss")) {
+                    put("reasoning_effort", "low")
+                }
+                put("max_completion_tokens", 800)
+            }
             put("messages", JSONArray().apply {
                 put(JSONObject().apply {
                     put("role", "system"); put("content", systemPrompt)
@@ -304,19 +400,78 @@ class GroqClient(
                 })
             })
         }
-        val outcome = postOnceDetailed(apiKey, body, model)
-        val raw = outcome.content
-            ?: throw IllegalStateException(
-                outcome.error?.take(200)
-                    ?: "Groq gagal menjawab (tanpa detail)."
-            )
-        val parsed = parseScores(raw)
-        if (parsed.isEmpty()) {
-            throw EmptyLlmScoreException(
-                "LLM tidak men-skor satu pun segmen (jawaban tidak ter-parse sebagai JSON skor)."
-            )
+    }
+
+    /** Error ini berarti strict mode ditolak server — fallback ke body biasa. */
+    private fun isStrictUnsupported(error: String?): Boolean {
+        if (error == null) return false
+        val lower = error.lowercase()
+        return "400" in lower || "response_format" in lower ||
+            "json_schema" in lower || "unsupported" in lower ||
+            "strict" in lower
+    }
+
+    /**
+     * v1.3.0 (#2): body rerank dengan skema strict yang sama
+     * polanya (ranking array). reasoning_effort=low hanya gpt-oss,
+     * max_completion_tokens 600 (6 kandidat, output pendek).
+     */
+    private fun rankingBody(
+        model: String,
+        systemPrompt: String,
+        userPrompt: String
+    ): JSONObject {
+        return JSONObject().apply {
+            put("model", model)
+            put("temperature", 0.4)
+            put("response_format", JSONObject().apply {
+                put("type", "json_schema")
+                put("json_schema", JSONObject().apply {
+                    put("name", "clip_ranking")
+                    put("strict", true)
+                    put("schema", JSONObject().apply {
+                        put("type", "object")
+                        put("properties", JSONObject().apply {
+                            put("ranking", JSONObject().apply {
+                                put("type", "array")
+                                put("items", JSONObject().apply {
+                                    put("type", "object")
+                                    put("properties", JSONObject().apply {
+                                        put("id", JSONObject().apply {
+                                            put("type", "integer")
+                                        })
+                                        put("rank", JSONObject().apply {
+                                            put("type", "integer")
+                                        })
+                                        put("score", JSONObject().apply {
+                                            put("type", "integer")
+                                        })
+                                    })
+                                    put("required", JSONArray().apply {
+                                        put("id"); put("rank"); put("score")
+                                    })
+                                    put("additionalProperties", false)
+                                })
+                            })
+                        })
+                        put("required", JSONArray().apply { put("ranking") })
+                        put("additionalProperties", false)
+                    })
+                })
+            })
+            if (model.startsWith("openai/gpt-oss")) {
+                put("reasoning_effort", "low")
+            }
+            put("max_completion_tokens", 600)
+            put("messages", JSONArray().apply {
+                put(JSONObject().apply {
+                    put("role", "system"); put("content", systemPrompt)
+                })
+                put(JSONObject().apply {
+                    put("role", "user"); put("content", userPrompt)
+                })
+            })
         }
-        parsed
     }
 
     /**
@@ -346,6 +501,18 @@ class GroqClient(
             rank 1 = paling layak. score 0-100.
         """.trimIndent()
         val userPrompt = "Judul video: $videoTitle\n\nKandidat:\n$candidateText"
+        // v1.3.0 (#2): strict JSON dulu per model; kalau semua model
+        // menolak strict, jatuh ke callChat lama (parser lama tetap).
+        for (model in MODELS) {
+            val outcome = postOnceDetailed(
+                apiKey, rankingBody(model, systemPrompt, userPrompt), model
+            )
+            val content = outcome.content
+            if (content != null) {
+                val parsed = parseRanking(content)
+                if (parsed != null) return@withContext parsed
+            }
+        }
         return@withContext try {
             val raw = callChat(apiKey, systemPrompt, userPrompt)
             parseRanking(raw)

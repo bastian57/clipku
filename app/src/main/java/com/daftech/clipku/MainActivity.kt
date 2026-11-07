@@ -14,6 +14,7 @@ import androidx.compose.ui.Modifier
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.daftech.clipku.ui.ClipKuTheme
 import com.daftech.clipku.ui.ClipKuViewModel
+import com.daftech.clipku.ui.HistoryScreen
 import com.daftech.clipku.ui.MainScreen
 import com.daftech.clipku.ui.SettingsScreen
 
@@ -37,14 +38,30 @@ class MainActivity : ComponentActivity() {
                     // Groq key dan hasil analisa tidak hilang saat pindah layar.
                     val viewModel: ClipKuViewModel = viewModel()
                     var showSettings by remember { mutableStateOf(false) }
+                    // v1.3.0 History: layar History (Room) — satu
+                    // ViewModel dipakai bersama supaya hasil restore
+                    // langsung mengisi MainScreen.
+                    var showHistory by remember { mutableStateOf(false) }
                     if (showSettings) {
                         SettingsScreen(
                             onBack = { showSettings = false },
                             viewModel = viewModel
                         )
+                    } else if (showHistory) {
+                        HistoryScreen(
+                            items = viewModel.historyItems,
+                            onOpen = { videoId ->
+                                viewModel.openHistory(videoId)
+                                showHistory = false
+                            },
+                            onDelete = { viewModel.deleteHistoryItem(it) },
+                            onDeleteAll = { viewModel.clearHistory() },
+                            onBack = { showHistory = false }
+                        )
                     } else {
                         MainScreen(
                             onOpenSettings = { showSettings = true },
+                            onOpenHistory = { showHistory = true },
                             viewModel = viewModel
                         )
                     }

@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.os.Environment
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -18,12 +19,17 @@ import com.daftech.clipku.analysis.Narration
 import com.daftech.clipku.analysis.Scoring
 import com.daftech.clipku.cutting.ClipDownload
 import com.daftech.clipku.groq.WhisperClient
+import com.daftech.clipku.history.AnalysisHistoryEntity
+import com.daftech.clipku.history.HistoryClipEntity
+import com.daftech.clipku.history.HistoryRepository
 import com.daftech.clipku.model.Clip
+import com.daftech.clipku.model.Sentence
 import com.daftech.clipku.model.VideoInfo
 import com.daftech.clipku.model.VideoStream
 import com.daftech.clipku.youtube.InnertubeClient
 import com.daftech.clipku.youtube.NewPipeStreamExtractor
 import com.daftech.clipku.youtube.VideoId
+import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -41,6 +47,21 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
     private val innertube = InnertubeClient()
     private val groq = GroqClient()
     private val whisper = WhisperClient()
+    // v1.3.0 History (Room): daftar analisa tersimpan, diamati reaktif.
+    private val historyRepository = HistoryRepository(application)
+
+    var historyItems by mutableStateOf<List<AnalysisHistoryEntity>>(emptyList())
+        private set
+    /** Banner "sudah dianalisa" saat link yang ditempel ada di History. */
+    var historyNotice by mutableStateOf<String?>(null)
+        private set
+    private var historyNoticeVideoId: String? = null
+
+    init {
+        viewModelScope.launch {
+            historyRepository.observeAll().collect { historyItems = it }
+        }
+    }
 
     var link by mutableStateOf("")
         private set
@@ -69,6 +90,37 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
     fun updateLink(value: String) {
         link = value
         lastCopied = false
+        historyNotice = null
+        historyNoticeVideoId = null
+        // v1.3.0 History: link yang ditempel sudah pernah dianalisa?
+        // Cek lokal (Room) — mencegah buang kuota Groq untuk video
+        // yang sama; banner menawarkan buka hasil lama / analisa ulang.
+        val videoId = VideoId.extract(value)
+        if (videoId != null) {
+            viewModelScope.launch {
+                val existing = try {
+                    historyRepository.getByVideoId(videoId)
+                } catch (e: Exception) {
+                    null
+                }
+                if (existing != null) {
+                    historyNotice = "Video ini sudah dianalisa — " +
+                        "buka hasil lama tanpa analisa ulang, atau " +
+                        "analisa ulang untuk menimpa hasil lama."
+                    historyNoticeVideoId = videoId
+                }
+            }
+        }
+    }
+
+    fun clearHistoryNotice() {
+        historyNotice = null
+        historyNoticeVideoId = null
+    }
+
+    fun openHistoryFromNotice() {
+        val videoId = historyNoticeVideoId ?: return
+        openHistory(videoId)
     }
 
     fun updateGroqKey(value: String) {
@@ -218,7 +270,12 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                             // satu URL per host dulu, jadi host
                             // Innertube yang berbeda tidak lagi
                             // terkubur oleh 35 URL satu host NewPipe.
+                            // v1.3.0 (#4): analisa audio memakai opus
+                            // bitrate TERENDAH dulu (hemat byte) —
+                            // audioUrl utama (bitrate tertinggi) tetap
+                            // dipakai untuk download clip, bukan analisa.
                             audioUrls = (
+                                listOfNotNull(newPipe.analysisAudioUrl) +
                                 newPipe.audioUrls.ifEmpty {
                                     listOfNotNull(newPipe.audioUrl)
                                 } + listOfNotNull(innertubeAudioUrl)
@@ -277,6 +334,7 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                             videoId, retryPreferred
                         )
                         val retryUrls = (
+                            listOfNotNull(fresh.analysisAudioUrl) +
                             fresh.audioUrls.ifEmpty {
                                 listOfNotNull(fresh.audioUrl)
                             } + listOfNotNull(innertubeAudioUrl)
@@ -301,6 +359,9 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                 var llmError: String? = null
                 // v1.0.7: jejak jendela scoring (chunked) untuk diagnostik.
                 var llmWindowsText = ""
+                // v1.3.0 History: angka jendela disimpan juga ke Room.
+                var llmWindowsSucceeded = 0
+                var llmWindowsTotal = 0
                 // v1.2.0: jejak pre-filter + paralel per model.
                 var prefilterText = ""
                 var parallelText = ""
@@ -335,6 +396,8 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                         // (lihat GroqClient.scoreSegmentsChunked).
                         val chunked = groq.scoreSegmentsChunked(key, info.title, inputs)
                         llmScores = chunked.scores
+                        llmWindowsSucceeded = chunked.windowsSucceeded
+                        llmWindowsTotal = chunked.windowsTotal
                         llmWindowsText = " • jendela LLM: " +
                             chunked.windowsSucceeded + "/" +
                             chunked.windowsTotal + " berhasil"
@@ -459,9 +522,18 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                     "audio track: " +
                     info.stream.audioTrackDescription.ifEmpty { "-" } + " • " +
                     "sumber stream: " + streamSource + " • audio HTTP: " +
-                    audioResult.httpCode + " • audio byte: " +
+                    // v1.3.0 (#4): streaming tidak punya HTTP code
+                    // (MediaExtractor) — tampilkan "-" bukan 0.
+                    (if (audioResult.httpCode > 0) {
+                        audioResult.httpCode.toString()
+                    } else {
+                        "-"
+                    }) + " • audio byte: " +
                     audioResult.downloadedBytes + " • audio mime: " +
-                    audioResult.mime.ifEmpty { "-" } + " • stream dicoba: " +
+                    audioResult.mime.ifEmpty { "-" } +
+                    // v1.3.0 (#4): streaming vs download-penuh.
+                    " • audio cara: " + audioResult.audioMethod +
+                    " • stream dicoba: " +
                     audioResult.streamsTried + audioErrorText + audioDnsText +
                     " • Groq key: " +
                     groqKeyText + " • skor LLM: " + llmScores.size + " segmen" +
@@ -502,6 +574,18 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                     status = ""
                 } else {
                     clips = found
+                    // v1.3.0 History: simpan hasil analisa lengkap ke
+                    // Room (upsert by videoId, maks 100 item + LRU).
+                    // Gagal simpan = analisa tetap jalan, bukan error.
+                    saveCurrentAnalysisToHistory(
+                        info = info,
+                        sentences = sentences,
+                        foundClips = found,
+                        diagnosticText = diagnostic,
+                        windowsSucceeded = llmWindowsSucceeded,
+                        windowsTotal = llmWindowsTotal,
+                        llmSegmentCount = llmScores.size
+                    )
                     val heatNote = if (info.heatPoints.isEmpty()) {
                         " (heatmap tidak tersedia — video ini mungkin belum cukup ditonton)"
                     } else ""
@@ -560,6 +644,17 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                     diagnostic + exportNote
                 }
                 status = "Clip ${clip.index} tersimpan: ${result.path} (${result.method})"
+                // v1.3.0 History: catat path + metode download ke
+                // entri History (badge "tersimpan" di daftar).
+                viewModelScope.launch(Dispatchers.IO) {
+                    try {
+                        historyRepository.updateClipDownload(
+                            info.videoId, clip.index, result.path, result.method
+                        )
+                    } catch (e: Exception) {
+                        // abaikan
+                    }
+                }
             } catch (e: Exception) {
                 updateClip(clip.index) { it.copy(isDownloading = false) }
                 error = e.message ?: "Download clip gagal."
@@ -658,6 +753,22 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                         narrationSource = transcriptSource
                     )
                 }
+                // v1.3.0 History: simpan narasi ke entri History
+                // (buka ulang dari History tidak generate ulang —
+                // hemat kuota Groq).
+                val savedInfo = currentInfo
+                if (savedInfo != null) {
+                    viewModelScope.launch(Dispatchers.IO) {
+                        try {
+                            historyRepository.updateClipNarration(
+                                savedInfo.videoId, clip.index,
+                                cleaned, transcriptSource
+                            )
+                        } catch (e: Exception) {
+                            // abaikan
+                        }
+                    }
+                }
             } catch (e: Exception) {
                 updateClip(clip.index) {
                     it.copy(
@@ -682,6 +793,209 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
         clipboard.setPrimaryClip(ClipData.newPlainText("Narasi ClipKu", text))
         lastCopied = true
         status = "Narasi clip ${clip.index} tersalin. Paste di SuaraKu untuk generate suara."
+    }
+
+    /**
+     * v1.3.0 History — simpan hasil analisa lengkap ke Room.
+     * Stream URL TIDAK disimpan (kedaluwarsa); thumbnail hanya URL.
+     * Analisa ulang menimpa baris lama (upsert by videoId).
+     */
+    private fun saveCurrentAnalysisToHistory(
+        info: VideoInfo,
+        sentences: List<Sentence>,
+        foundClips: List<Clip>,
+        diagnosticText: String,
+        windowsSucceeded: Int,
+        windowsTotal: Int,
+        llmSegmentCount: Int
+    ) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val entity = AnalysisHistoryEntity(
+                    videoId = info.videoId,
+                    title = info.title,
+                    channelName = info.author,
+                    durationMs = info.durationMs,
+                    thumbnailUrl = "https://i.ytimg.com/vi/${info.videoId}/hqdefault.jpg",
+                    analyzedAt = System.currentTimeMillis(),
+                    clipCount = foundClips.size,
+                    transcriptSentenceCount = sentences.size,
+                    audioTrackDescription = info.stream.audioTrackDescription,
+                    heatmapPointCount = info.heatPoints.size,
+                    diagnosticSummary = diagnosticText,
+                    transcriptJson = HistoryRepository.sentencesToJson(sentences),
+                    llmWindowSucceeded = windowsSucceeded,
+                    llmWindowTotal = windowsTotal,
+                    llmSegmentCount = llmSegmentCount,
+                    downloadedCount = foundClips.count { it.savedPath != null }
+                )
+                val clipEntities = foundClips.map { clip ->
+                    HistoryClipEntity(
+                        videoId = info.videoId,
+                        clipIndex = clip.index,
+                        startMs = clip.startMs,
+                        endMs = clip.endMs,
+                        score = (clip.score * 100).toInt().coerceIn(0, 100),
+                        title = clip.title,
+                        reason = clip.reason,
+                        transcriptText = clip.transcript,
+                        narrationText = clip.narration,
+                        narrationSource = clip.narrationSource,
+                        downloadedPath = clip.savedPath,
+                        downloadMethod = null
+                    )
+                }
+                historyRepository.saveAnalysis(entity, clipEntities)
+            } catch (e: Exception) {
+                // History gagal simpan = analisa tetap jalan, bukan error.
+            }
+        }
+    }
+
+    /**
+     * v1.3.0 History — buka hasil lama TANPA analisa ulang dan TANPA
+     * network (state di-restore dari Room). Stream URL tidak disimpan,
+     * jadi refreshStreamsForHistory me-resolve stream fresh di
+     * belakang supaya Preview/Download tetap jalan; kalau refresh
+     * gagal, hasil tetap tampil dan Preview/Download gagal jujur.
+     */
+    fun openHistory(videoId: String) {
+        viewModelScope.launch {
+            try {
+                val entity = historyRepository.getByVideoId(videoId) ?: run {
+                    error = "Hasil analisa itu sudah tidak ada di History."
+                    return@launch
+                }
+                val clipEntities = historyRepository.getClips(videoId)
+                stopPreview()
+                link = "https://youtu.be/$videoId"
+                historyNotice = null
+                historyNoticeVideoId = null
+                error = null
+                videoTitle = entity.title
+                videoAuthor = entity.channelName
+                diagnostic = entity.diagnosticSummary
+                clips = clipEntities.map { clipEntity ->
+                    Clip(
+                        index = clipEntity.clipIndex,
+                        startMs = clipEntity.startMs,
+                        endMs = clipEntity.endMs,
+                        title = clipEntity.title,
+                        reason = clipEntity.reason,
+                        score = (clipEntity.score / 100.0).coerceIn(0.0, 1.0),
+                        transcript = clipEntity.transcriptText,
+                        savedPath = resolveSavedPath(clipEntity.downloadedPath),
+                        narration = clipEntity.narrationText,
+                        narrationSource = clipEntity.narrationSource,
+                        narrationWordCount = clipEntity.narrationText?.let {
+                            Narration.wordCount(it)
+                        } ?: 0
+                    )
+                }
+                currentInfo = VideoInfo(
+                    videoId = videoId,
+                    title = entity.title,
+                    author = entity.channelName,
+                    durationMs = entity.durationMs,
+                    stream = VideoStream(
+                        progressiveUrl = null,
+                        videoOnlyUrl = null,
+                        audioUrl = null,
+                        mimeProgressive = null,
+                        audioTrackDescription = entity.audioTrackDescription
+                    ),
+                    captionTracks = emptyList(),
+                    heatPoints = emptyList(),
+                    chapters = emptyList()
+                )
+                status = "Dibuka dari History — tanpa analisa ulang."
+                refreshStreamsForHistory(videoId)
+            } catch (e: Exception) {
+                error = e.message ?: "Gagal membuka History."
+            }
+        }
+    }
+
+    /** Resolve stream fresh untuk hasil History (best-effort, tanpa throw). */
+    private suspend fun refreshStreamsForHistory(videoId: String) {
+        try {
+            var freshInfo = innertube.fetchVideoInfo(videoId)
+            val preferredLanguage = if (freshInfo.captionTracks.any {
+                    it.languageCode.startsWith("id")
+                }
+            ) {
+                "id"
+            } else {
+                freshInfo.captionTracks.firstOrNull()?.languageCode
+                    ?.take(2)?.lowercase()
+            }
+            val newPipe = NewPipeStreamExtractor.extract(videoId, preferredLanguage)
+            if (newPipe.audioUrl != null || newPipe.videoUrl != null) {
+                freshInfo = freshInfo.copy(
+                    stream = VideoStream(
+                        progressiveUrl = freshInfo.stream.progressiveUrl,
+                        videoOnlyUrl = newPipe.videoUrl
+                            ?: freshInfo.stream.videoOnlyUrl,
+                        audioUrl = newPipe.audioUrl ?: freshInfo.stream.audioUrl,
+                        mimeProgressive = freshInfo.stream.mimeProgressive,
+                        audioTrackDescription = if (newPipe.audioUrl != null) {
+                            newPipe.audioTrackDescription.ifEmpty {
+                                freshInfo.stream.audioTrackDescription
+                            }
+                        } else {
+                            freshInfo.stream.audioTrackDescription
+                        }
+                    )
+                )
+            }
+            val current = currentInfo
+            if (current != null) {
+                currentInfo = current.copy(stream = freshInfo.stream)
+            }
+        } catch (e: Exception) {
+            // Refresh gagal = hasil History tetap tampil; Preview /
+            // Download tanpa stream gagal jujur saat ditekan.
+        }
+    }
+
+    /**
+     * Path clip tersimpan yang dicatat History bisa basi (user hapus
+     * file dari luar app) — kembalikan null kalau file tidak ada,
+     * supaya UI tidak mengklaim "Tersimpan" padahal file hilang.
+     */
+    private fun resolveSavedPath(path: String?): String? {
+        if (path.isNullOrBlank()) return null
+        val file = if (path.startsWith("/")) {
+            File(path)
+        } else {
+            File(
+                Environment.getExternalStoragePublicDirectory(
+                    Environment.DIRECTORY_DOWNLOADS
+                ),
+                path.removePrefix("Download/").removePrefix("/")
+            )
+        }
+        return if (file.exists()) path else null
+    }
+
+    fun deleteHistoryItem(videoId: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                historyRepository.deleteByVideoId(videoId)
+            } catch (e: Exception) {
+                // abaikan — daftar di-refresh dari Flow
+            }
+        }
+    }
+
+    fun clearHistory() {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                historyRepository.deleteAll()
+            } catch (e: Exception) {
+                // abaikan
+            }
+        }
     }
 
     private fun updateClip(index: Int, transform: (Clip) -> Clip) {

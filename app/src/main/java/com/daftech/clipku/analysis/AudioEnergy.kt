@@ -5,6 +5,7 @@ import android.media.MediaExtractor
 import android.media.MediaFormat
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
@@ -37,7 +38,13 @@ data class AudioAnalysisResult(
      * failedHost = host googlevideo yang gagal di-resolve.
      */
     val dnsFailure: Boolean = false,
-    val failedHost: String? = null
+    val failedHost: String? = null,
+    /**
+     * v1.3.0 (#4): "streaming" kalau RMS didapat lewat
+     * MediaExtractor dari URL langsung, "download-penuh" kalau
+     * lewat jalur unduh file seperti dulu.
+     */
+    val audioMethod: String = "download-penuh"
 )
 
 private data class DecodeOutcome(
@@ -49,6 +56,8 @@ private data class DecodeOutcome(
 object AudioEnergy {
     private const val BROWSER_UA =
         "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
+    /** v1.3.0 (#4): batas percobaan streaming sebelum fallback download. */
+    private const val STREAMING_TIMEOUT_MS = 90_000L
 
     suspend fun analyse(
         audioUrl: String?,
@@ -141,11 +150,31 @@ object AudioEnergy {
         return false
     }
 
+    /**
+     * v1.3.0 (#4): coba STREAMING dulu — MediaExtractor membuka URL
+     * audio langsung (dengan UA + Referer yang sama seperti download)
+     * dan RMS dihitung dari PCM yang mengalir, sambil jaringan masih
+     * mengunduh — decode + download tumpang-tindih, tanpa tulis/baca
+     * file cache. Timeout 90 detik; gagal/timeout/kosong = jatuh ke
+     * jalur download-penuh di bawah (analisa TIDAK digagalkan oleh
+     * streaming). JUJUR: apakah extractor benar-benar tidak menarik
+     * file penuh belum terbukti (container/moov) — ukur waktu di HP;
+     * yang pasti hemat adalah tidak adanya tulis/baca disk.
+     */
     private suspend fun analyseOne(
         audioUrl: String,
         cacheDir: File,
         http: OkHttpClient
     ): AudioAnalysisResult = withContext(Dispatchers.IO) {
+        val streamed = withTimeoutOrNull(STREAMING_TIMEOUT_MS) {
+            decodeStreaming(audioUrl)
+        }
+        if (streamed != null && streamed.bySecond.isNotEmpty()) {
+            return@withContext AudioAnalysisResult(
+                streamed.bySecond, 0, 0, streamed.mime, null, 0,
+                audioMethod = "streaming"
+            )
+        }
         var tmp: File? = null
         try {
             val request = Request.Builder()
@@ -219,10 +248,49 @@ object AudioEnergy {
         }
     }
 
+    /** v1.3.0 (#4): decode streaming dari URL langsung (tanpa file). */
+    private fun decodeStreaming(audioUrl: String): DecodeOutcome {
+        val extractor = MediaExtractor()
+        return try {
+            extractor.setDataSource(
+                audioUrl,
+                mapOf(
+                    "User-Agent" to BROWSER_UA,
+                    "Referer" to "https://www.youtube.com/"
+                )
+            )
+            decodeFromExtractor(extractor)
+        } catch (e: Exception) {
+            DecodeOutcome(
+                emptyMap(), "", (e.message ?: "gagal streaming").take(80)
+            )
+        } finally {
+            try { extractor.release() } catch (e: Exception) { /* abaikan */ }
+        }
+    }
+
     private fun decodeRmsPerSecond(file: File): DecodeOutcome {
         val extractor = MediaExtractor()
-        try {
+        return try {
             extractor.setDataSource(file.absolutePath)
+            decodeFromExtractor(extractor)
+        } catch (e: Exception) {
+            DecodeOutcome(
+                emptyMap(), "", (e.message ?: "gagal decode").take(80)
+            )
+        } finally {
+            try { extractor.release() } catch (e: Exception) { /* abaikan */ }
+        }
+    }
+
+    /**
+     * v1.3.0 (#4): inti decode RMS — dipakai file lokal DAN streaming.
+     * Extractor sudah di-setDataSource oleh pemanggil; fungsi ini hanya
+     * memilih track audio, decode ke PCM, dan menghitung RMS per detik.
+     * TIDAK me-release extractor (pemiliknya yang me-release).
+     */
+    private fun decodeFromExtractor(extractor: MediaExtractor): DecodeOutcome {
+        try {
             var trackIndex = -1
             var format: MediaFormat? = null
             for (i in 0 until extractor.trackCount) {
@@ -312,9 +380,9 @@ object AudioEnergy {
             return DecodeOutcome(
                 emptyMap(), "", (e.message ?: "gagal decode").take(80)
             )
-        } finally {
-            try { extractor.release() } catch (e: Exception) { /* abaikan */ }
         }
+        // TANPA finally release: extractor milik pemanggil
+        // (decodeStreaming / decodeRmsPerSecond) yang me-release.
     }
 
     private fun accumulate(

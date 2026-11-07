@@ -1,4 +1,9 @@
 plugins {
-    id 'com.android.application' version '8.5.2' apply false
+    // v1.3.0 (#5 Media3 1.11.1): AGP 8.5.2 mentok compileSdk 34,
+    // media3 1.5+ butuh compileSdk 35 — AGP naik ke 8.7.3
+    // (butuh Gradle 8.9+, JDK 17 — lihat gradle-wrapper.properties
+    // dan workflow). Kotlin tetap 1.9.25 (kompatibel dengan AGP 8.7).
+    id 'com.android.application' version '8.7.3' apply false
     id 'org.jetbrains.kotlin.android' version '1.9.25' apply false
+    id 'org.jetbrains.kotlin.kapt' version '1.9.25' apply false
 }

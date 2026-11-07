@@ -1,18 +1,21 @@
 plugins {
     id 'com.android.application'
     id 'org.jetbrains.kotlin.android'
+    // v1.3.0 History: Room butuh annotation processing — KAPT
+    // (bukan KSP2, yang butuh Kotlin 2.x; KGP di sini tetap 1.9.25).
+    id 'org.jetbrains.kotlin.kapt'
 }
 
 android {
     namespace 'com.daftech.clipku'
-    compileSdk 34
+    compileSdk 35
 
     defaultConfig {
         applicationId 'com.daftech.clipku'
         minSdk 24
-        targetSdk 34
-        versionCode 12
-        versionName '1.2.0'
+        targetSdk 35
+        versionCode 13
+        versionName '1.3.0'
         testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
         vectorDrawables { useSupportLibrary = true }
         ndk {
@@ -58,7 +61,11 @@ android {
 
 dependencies {
     def composeBom = '2024.06.00'
-    def media3Version = '1.4.1'
+    // v1.3.0 (#5): media3 1.4.1 -> 1.11.1 (stabil 26 Okt 2026).
+    // InAppMp4Muxer jadi muxer default sejak 1.9.0 — tidak ada
+    // perubahan code Transformer yang dipaksa API ini.
+    def media3Version = '1.11.1'
+    def roomVersion = '2.8.5'
     implementation platform("androidx.compose:compose-bom:$composeBom")
     implementation 'androidx.compose.ui:ui'
     implementation 'androidx.compose.ui:ui-graphics'
@@ -71,11 +78,16 @@ dependencies {
     implementation 'androidx.core:core-ktx:1.13.1'
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1'
 
-    // Media3 PIN 1.4.1: 1.5.x butuh compileSdk 35 (pelajaran AGENTS.md 2026-10-17).
+    // v1.3.0 (#5): media3 1.11.1 (compileSdk 35 + AGP 8.7.3).
     implementation "androidx.media3:media3-exoplayer:$media3Version"
     implementation "androidx.media3:media3-transformer:$media3Version"
     implementation "androidx.media3:media3-ui:$media3Version"
     implementation "androidx.media3:media3-common:$media3Version"
+
+    // v1.3.0 History: Room 2.8.5 (stabil 9 Sep 2026) via KAPT.
+    implementation "androidx.room:room-runtime:$roomVersion"
+    implementation "androidx.room:room-ktx:$roomVersion"
+    kapt "androidx.room:room-compiler:$roomVersion"
 
     // HTTP Innertube + Groq. org.json bawaan Android dipakai untuk JSON
     // (tanpa Gson/Moshi, supaya dependensi tetap sedikit).

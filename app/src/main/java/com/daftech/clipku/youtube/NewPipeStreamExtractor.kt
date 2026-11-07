@@ -66,7 +66,15 @@ data class NewPipeStreamResult(
     // (lihat pickAudioStreams), bukan lagi mp4 dulu.
     val audioUrls: List<String> = emptyList(),
     /** v1.0.5: deskripsi track audio yang dipilih, mis. "id, original". */
-    val audioTrackDescription: String = ""
+    val audioTrackDescription: String = "",
+    /**
+     * v1.3.0 (#4): URL audio bitrate TERENDAH (diutamakan opus) di
+     * tier bahasa yang sama dengan audioUrl — HANYA untuk analisa
+     * RMS (hemat byte, ~65-70% vs 160 kbps), BUKAN untuk download
+     * clip (tetap pakai audioUrl bitrate tertinggi). Null kalau
+     * tidak ada kandidat yang lebih rendah dari audioUrl.
+     */
+    val analysisAudioUrl: String? = null
 )
 
 object NewPipeStreamExtractor {
@@ -128,7 +136,8 @@ object NewPipeStreamExtractor {
                 video,
                 subtitles,
                 rankedAudio.mapNotNull { it.url }.filter { it.isNotEmpty() }.distinct(),
-                audioDescription
+                audioDescription,
+                pickAnalysisAudio(rankedAudio, preferred)
             )
         } catch (e: Exception) {
             NewPipeStreamResult(null, null, emptyList())
@@ -217,6 +226,35 @@ object NewPipeStreamExtractor {
         stream.format?.mimeType?.contains("mp4") == true
     } catch (e: Exception) {
         false
+    }
+
+    private fun isOpus(stream: AudioStream): Boolean = try {
+        val mime = stream.format?.mimeType?.lowercase() ?: ""
+        "opus" in mime || "webm" in mime
+    } catch (e: Exception) {
+        false
+    }
+
+    /**
+     * v1.3.0 (#4): audio termurah untuk ANALISA RMS — di tier bahasa
+     * yang sama dengan audioUrl utama (rank yang sama), diutamakan
+     * opus, bitrate terendah. RMS per detik tidak butuh 160 kbps;
+     * opus ~50 kbps memangkas byte ~65-70%. Null kalau hanya ada
+     * satu stream atau yang termurah = audioUrl itu sendiri.
+     */
+    private fun pickAnalysisAudio(
+        ranked: List<AudioStream>,
+        preferred: String
+    ): String? {
+        if (ranked.size < 2) return null
+        val topRank = audioRank(ranked.first(), preferred)
+        val sameTier = ranked.filter { audioRank(it, preferred) == topRank }
+        if (sameTier.size < 2) return null
+        val opus = sameTier.filter { isOpus(it) }
+        val pool = opus.ifEmpty { sameTier }
+        val lowest = pool.minByOrNull { bitrateOf(it) } ?: return null
+        val url = lowest.url?.takeIf { it.isNotEmpty() } ?: return null
+        return if (url == ranked.first().url) null else url
     }
 
     private fun bitrateOf(stream: AudioStream): Int = try {

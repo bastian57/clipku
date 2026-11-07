@@ -46,6 +46,7 @@ import com.daftech.clipku.model.Clip
 @Composable
 fun MainScreen(
     onOpenSettings: () -> Unit,
+    onOpenHistory: () -> Unit = {},
     viewModel: ClipKuViewModel = viewModel()
 ) {
     val context = LocalContext.current
@@ -62,7 +63,11 @@ fun MainScreen(
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
             Text(text = "ClipKu", style = MaterialTheme.typography.headlineMedium)
-            TextButton(onClick = onOpenSettings) { Text("Settings") }
+            Row {
+                // v1.3.0 History: daftar analisa tersimpan (Room).
+                TextButton(onClick = onOpenHistory) { Text("History") }
+                TextButton(onClick = onOpenSettings) { Text("Settings") }
+            }
         }
         Text(
             text = "Tempel link YouTube. APK menonton dan menganalisa " +
@@ -84,6 +89,29 @@ fun MainScreen(
             modifier = Modifier.fillMaxWidth()
         ) {
             Text(if (viewModel.isAnalysing) "Menganalisa…" else "Analisa")
+        }
+        // v1.3.0 History: link yang ditempel sudah pernah dianalisa —
+        // tawarkan buka hasil lama (tanpa analisa ulang / tanpa
+        // network) atau analisa ulang (menimpa entri lama).
+        viewModel.historyNotice?.let { notice ->
+            Card(
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.secondaryContainer
+                ),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Text(text = notice, style = MaterialTheme.typography.bodyMedium)
+                    Row {
+                        TextButton(onClick = { viewModel.openHistoryFromNotice() }) {
+                            Text("Buka Hasil Lama")
+                        }
+                        TextButton(onClick = { viewModel.clearHistoryNotice() }) {
+                            Text("Abaikan")
+                        }
+                    }
+                }
+            }
         }
         if (viewModel.status.isNotBlank()) {
             Text(text = viewModel.status, style = MaterialTheme.typography.bodyMedium)
