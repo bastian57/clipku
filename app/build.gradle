@@ -61,10 +61,14 @@ android {
 
 dependencies {
     def composeBom = '2024.06.00'
-    // v1.3.0 (#5): media3 1.4.1 -> 1.11.1 (stabil 26 Okt 2026).
-    // InAppMp4Muxer jadi muxer default sejak 1.9.0 — tidak ada
-    // perubahan code Transformer yang dipaksa API ini.
-    def media3Version = '1.11.1'
+    // v1.3.0 (#5): media3 1.4.1 -> 1.9.0. fix1 (2026-11-07): 1.11.1
+    // GAGAL di checkDebugAarMetadata — AAR 1.10.0+ menuntut
+    // minCompileSdk=36 (terverifikasi dari aar-metadata.properties
+    // resmi Google Maven), sementara AGP 8.7.3 mentok compileSdk 35.
+    // 1.9.0 = versi TERBARU dengan minCompileSdk=35. InAppMp4Muxer
+    // jadi muxer default sejak 1.9.0 — tidak ada perubahan code
+    // Transformer yang dipaksa API ini.
+    def media3Version = '1.9.0'
     def roomVersion = '2.8.5'
     implementation platform("androidx.compose:compose-bom:$composeBom")
     implementation 'androidx.compose.ui:ui'
@@ -78,7 +82,8 @@ dependencies {
     implementation 'androidx.core:core-ktx:1.13.1'
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1'
 
-    // v1.3.0 (#5): media3 1.11.1 (compileSdk 35 + AGP 8.7.3).
+    // v1.3.0 (#5): media3 1.9.0 (compileSdk 35 + AGP 8.7.3).
+    // fix1: 1.11.1 -> 1.9.0 (minCompileSdk 36 vs 35, lihat atas).
     implementation "androidx.media3:media3-exoplayer:$media3Version"
     implementation "androidx.media3:media3-transformer:$media3Version"
     implementation "androidx.media3:media3-ui:$media3Version"

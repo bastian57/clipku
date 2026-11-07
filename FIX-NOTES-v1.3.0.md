@@ -5,6 +5,14 @@
 **Perintah:** "Gas semua langsung, mau apk final" — semua sisa upgrade (#2, #3, #4, #5) + History Analisa masuk SATU build ini, menggantikan pola satu-versi-per-upgrade.
 **Yang TIDAK diubah:** keystore/signing, perilaku #1 (pre-filter Top-12 + scoring paralel 3 model), download/segment HandlerThread v1.1.0, narasi, Whisper.
 
+## fix1 (2026-11-07 21:31 WIB, asisten langsung) — media3 1.11.1 → 1.9.0
+
+**Run merah:** 42381411781 (head e40c95a), `BUILD FAILED in 42s`, `:app:checkDebugAarMetadata FAILED` — 11 issue, semua artefak media3 1.11.1: *"requires libraries and applications that depend on it to compile against version 36 or later of the Android APIs. :app is currently compiled against android-35. Also, the maximum recommended compile SDK version for Android Gradle plugin 8.7.3 is 35."*
+
+**Akar:** media3 **1.10.0+ menuntut minCompileSdk=36** — terverifikasi langsung dari `aar-metadata.properties` AAR resmi Google Maven (1.10.0/1.10.1/1.11.0/1.11.1 = `minCompileSdk=36`; 1.9.0/1.8.0/1.7.1 = `minCompileSdk=35`). Jadi 1.11.1 TIDAK BISA hidup di compileSdk 35 + AGP 8.7.3, apapun yang dilakukan. Naik ke compileSdk 36 butuh AGP ≥8.10 + Gradle ≥8.11 + kemungkinan Kotlin 2.0 — kaskade lebih besar, TIDAK diambil (risiko baru di build final).
+
+**Fix:** satu baris — `def media3Version = '1.9.0'` di `app/build.gradle` (versi TERBARU yang masih `minCompileSdk=35`). compileSdk 35, targetSdk 35, AGP 8.7.3, Gradle 8.9 tetap. API media3 yang dipakai code (`MediaItem`, `ExoPlayer`, `Composition`, `EditedMediaItem(Sequence)`, `ExportException/Result`, `Transformer`, `PlayerView`) semuanya sudah ada sejak era 1.4 — tidak ada pemakaian API 1.10/1.11. Versi tetap 1.3.0/vc13. Jujur: lonjakan media3 yang beneran kepakai dari 1.4.1 → 1.9.0 tetap nyata (5 minor), tapi klaim "1.11.1" di catatan awal gugur — yang diuji Actions nanti adalah 1.9.0.
+
 ---
 
 ## #2 STRICT JSON (Groq structured output)
