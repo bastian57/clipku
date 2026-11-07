@@ -3,6 +3,10 @@ package com.daftech.clipku.cutting
 import android.content.Context
 import android.media.MediaExtractor
 import android.media.MediaFormat
+import android.os.Handler
+import android.os.HandlerThread
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import androidx.media3.common.MediaItem
 import androidx.media3.transformer.Composition
 import androidx.media3.transformer.EditedMediaItem
@@ -201,6 +205,21 @@ object SegmentExport {
      * CuttingEngine.cutWithTransformer, sengaja diduplikasi di sini
      * supaya jalur fallback v1.0.5 di CuttingEngine TIDAK disentuh
      * sama sekali oleh upgrade ini.
+     *
+     * v1.1.0 — SEMUA akses Transformer jalan di SATU HandlerThread
+     * khusus ("ClipKuTransformer"). Media3 Transformer 1.4.1
+     * menangkap Looper.myLooper() saat konstruksi dan menolak
+     * akses dari thread lain ("Transformer is accessed on the
+     * wrong thread."). Sebelum v1.1.0 fungsi ini dipanggil dari
+     * Dispatchers.IO — thread pool yang ganti-ganti thread — jadi
+     * jalur segmen TIDAK PERNAH berhasil sejak v1.0.6 dan semua
+     * download jatuh ke full-download. Di sini: konstruksi,
+     * start(), cancel(), dan callback listener semuanya di-post
+     * ke Handler thread itu; resume() continuation dari thread
+     * mana saja aman, yang dilarang hanya akses Transformer-nya.
+     * Thread di-quit (quitSafely) tepat sekali lewat finish(),
+     * termasuk saat coroutine dibatalkan (timeout 180/120 detik
+     * di ClipDownload) — tidak bocor thread per export.
      */
     private suspend fun transformRemote(
         context: Context,
@@ -208,30 +227,55 @@ object SegmentExport {
         output: File
     ): Boolean = suspendCancellableCoroutine { continuation ->
         if (output.exists()) output.delete()
-        val sequences = items.map { item ->
-            EditedMediaItemSequence(EditedMediaItem.Builder(item).build())
+        val thread = HandlerThread("ClipKuTransformer").apply { start() }
+        val handler = Handler(thread.looper)
+        val transformerRef = AtomicReference<Transformer?>(null)
+        val finished = AtomicBoolean(false)
+        fun finish(ok: Boolean, error: Throwable?) {
+            if (!finished.compareAndSet(false, true)) return
+            try { thread.quitSafely() } catch (e: Exception) { /* abaikan */ }
+            if (!continuation.isActive) return
+            if (error != null) continuation.resumeWithException(error)
+            else continuation.resume(ok)
         }
-        val composition = Composition.Builder(sequences).build()
-        val transformer = Transformer.Builder(context)
-            .addListener(object : Transformer.Listener {
-                override fun onCompleted(composition: Composition, exportResult: ExportResult) {
-                    if (continuation.isActive) continuation.resume(true)
+        handler.post {
+            try {
+                val sequences = items.map { item ->
+                    EditedMediaItemSequence(EditedMediaItem.Builder(item).build())
                 }
+                val composition = Composition.Builder(sequences).build()
+                val transformer = Transformer.Builder(context)
+                    .addListener(object : Transformer.Listener {
+                        override fun onCompleted(
+                            composition: Composition,
+                            exportResult: ExportResult
+                        ) {
+                            finish(true, null)
+                        }
 
-                override fun onError(
-                    composition: Composition,
-                    exportResult: ExportResult,
-                    exportException: ExportException
-                ) {
-                    if (continuation.isActive) {
-                        continuation.resumeWithException(exportException)
-                    }
-                }
-            })
-            .build()
-        transformer.start(composition, output.absolutePath)
+                        override fun onError(
+                            composition: Composition,
+                            exportResult: ExportResult,
+                            exportException: ExportException
+                        ) {
+                            finish(false, exportException)
+                        }
+                    })
+                    .build()
+                transformerRef.set(transformer)
+                transformer.start(composition, output.absolutePath)
+            } catch (e: Exception) {
+                finish(false, e)
+            }
+        }
         continuation.invokeOnCancellation {
-            try { transformer.cancel() } catch (e: Exception) { /* abaikan */ }
+            // Cancel WAJIB di thread Transformer juga — dan finish()
+            // kedua (setelah cancel) menjamin thread ter-quit walau
+            // cancel tidak memicu callback onError sekalipun.
+            handler.post {
+                try { transformerRef.get()?.cancel() } catch (e: Exception) { /* abaikan */ }
+            }
+            handler.post { finish(false, null) }
         }
     }
 
