@@ -301,11 +301,24 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                 var llmError: String? = null
                 // v1.0.7: jejak jendela scoring (chunked) untuk diagnostik.
                 var llmWindowsText = ""
+                // v1.2.0: jejak pre-filter + paralel per model.
+                var prefilterText = ""
+                var parallelText = ""
                 val key = prefs.groqApiKey.trim()
                 if (key.isNotBlank() && segments.isNotEmpty()) {
                     status = "Menilai highlight dengan Groq…"
                     try {
-                        val inputs = segments.map { segment ->
+                        // v1.2.0 — pre-filter transcript-only (upgrade
+                        // #1 riset super-cepat): LLM hanya men-skor
+                        // Top-12 segmen (Scoring.TOP_N_LLM). Segmen di
+                        // luar Top-12 tetap masuk selectClips di bawah
+                        // (tanpa skor LLM) — bukan dibuang.
+                        val prefiltered = Scoring.prefilterSegmentsForLlm(
+                            segments, sentences
+                        )
+                        prefilterText = " • pre-filter: " + segments.size +
+                            " segmen → Top " + prefiltered.size
+                        val inputs = prefiltered.map { segment ->
                             GroqClient.SegmentInput(
                                 id = segment.id,
                                 startLabel = VideoId.formatMs(segment.startMs),
@@ -318,11 +331,19 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                         // call dan kena HTTP 413 di qwen3.8-27b. Kini
                         // tiap call maks ~8 segmen / 12 menit; satu
                         // jendela gagal tidak menolkan video.
+                        // v1.2.0: jendela dieksekusi paralel ke 3 model
+                        // (lihat GroqClient.scoreSegmentsChunked).
                         val chunked = groq.scoreSegmentsChunked(key, info.title, inputs)
                         llmScores = chunked.scores
                         llmWindowsText = " • jendela LLM: " +
                             chunked.windowsSucceeded + "/" +
                             chunked.windowsTotal + " berhasil"
+                        if (chunked.modelWins.isNotEmpty()) {
+                            parallelText = " • LLM paralel: " +
+                                chunked.modelWins.entries.joinToString(", ") { (model, count) ->
+                                    "$model:$count"
+                                }
+                        }
                         if (chunked.windowsFailed > 0) {
                             // Error terakhir dicatat, skor yang berhasil
                             // dari jendela lain tetap dipakai.
@@ -446,7 +467,8 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                     groqKeyText + " • skor LLM: " + llmScores.size + " segmen" +
                     (if (llmError != null) " (gagal: " + llmError + ")" else "") +
                     // v1.0.7: berapa jendela scoring yang berhasil/gagal.
-                    llmWindowsText + zeroText
+                    // v1.2.0: jejak pre-filter + jendela per model.
+                    llmWindowsText + prefilterText + parallelText + zeroText
                 if (found.isEmpty()) {
                     // v1.0.8 P0-1: pesan penolakan dibangun dari sinyal
                     // yang BENAR-BENAR nol — bukan blanket "tidak punya

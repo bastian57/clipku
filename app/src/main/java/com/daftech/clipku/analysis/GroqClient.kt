@@ -1,6 +1,9 @@
 package com.daftech.clipku.analysis
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -111,8 +114,18 @@ class GroqClient(
         val windowsSucceeded: Int,
         val windowsFailed: Int,
         /** Error terakhir (HTTP + pesan Groq, dipotong) — TIDAK PERNAH berisi key. */
-        val lastError: String?
+        val lastError: String?,
+        /** v1.2.0 — jendela yang berhasil per model ("120b"/"20b"/"qwen"). */
+        val modelWins: Map<String, Int> = emptyMap()
     )
+
+    /** Nama pendek model untuk diagnostik ("120b"/"20b"/"qwen"). */
+    fun shortModelName(model: String): String = when (model) {
+        PRIMARY_MODEL -> "120b"
+        FALLBACK_MODEL -> "20b"
+        QWEN_MODEL -> "qwen"
+        else -> model.substringAfterLast("/").take(12)
+    }
 
     /** Satu kandidat clip untuk rerank komparatif (satu call, semua kandidat). */
     data class RerankInput(
@@ -127,15 +140,33 @@ class GroqClient(
 
     data class RerankResult(val id: Int, val rank: Int, val score: Int)
 
+    /** Hasil satu jendela: skor + model yang berhasil, atau error. */
+    private data class WindowOutcome(
+        val scores: Map<Int, SegmentScore>,
+        val model: String?,
+        val error: String?
+    )
+
     /**
-     * v1.0.7 — scoring ber-chunk dengan isolasi gagal per jendela.
-     * Segmen dibagi jendela waktu [WINDOW_MS] dengan overlap
-     * [WINDOW_OVERLAP_MS]; tiap jendela satu call scoreSegments.
-     * Jendela yang gagal (413/429/timeout/parse) di-skip dan dicatat,
-     * TIDAK menggagalkan video — satu jendela gagal tidak boleh
-     * menolkan seluruh video seperti yang terjadi di ALI v1.0.6.
+     * v1.2.0 — scoring ber-chunk PARALEL 3 model (upgrade #1 riset
+     * super-cepat). Jendela dibangun sama seperti v1.0.7 (8 segmen,
+     * langkah 7 ≈ overlap 1 segmen), tapi dieksekusi paralel:
+     * jendela dibagikan round-robin ke 3 model Groq gratis
+     * (gpt-oss-120b, gpt-oss-20b, qwen3.8-27b). Limit TPM Groq
+     * berlaku PER MODEL, bukan per akun — jadi paralel lintas model
+     * tidak melanggar batas 8.000 TPM per model. Pacing antar call
+     * ke model YANG SAMA dipertahankan: jendela ke model yang sama
+     * di-stagger WINDOW_DELAY_MS (12 detik) — jendela 0/1/2 mulai
+     * langsung, 3/4/5 setelah 12 detik, dst.
+     * Isolasi gagal per jendela tetap berlaku (v1.0.7): satu jendela
+     * gagal tidak menolkan video. Gagal di model yang ditugaskan —
+     * kecuali 413 (prompt terlalu besar akan gagal di semua model
+     * dengan prompt yang sama) — dicoba SEKALI ke model lain; kalau
+     * itu pun gagal, jendela dicatat gagal dan segmennya tetap bisa
+     * jadi clip lewat jalur transcript-only di Scoring.
      * Segmen yang masuk dua jendela (overlap) di-dedupe: skor
-     * tertinggi yang menang.
+     * tertinggi yang menang. Jendela dihitung BERHASIL hanya kalau
+     * LLM benar-benar men-skor >=1 segmen (v1.0.8 P0-7).
      */
     suspend fun scoreSegmentsChunked(
         apiKey: String,
@@ -146,52 +177,145 @@ class GroqClient(
         if (segments.isEmpty()) {
             return@withContext ChunkedScoreResult(emptyMap(), 0, 0, 0, null)
         }
+        // Bangun daftar jendela dulu (8 segmen, langkah 7) — sama
+        // seperti v1.0.7, hanya eksekusinya yang paralel.
+        val windows = mutableListOf<List<SegmentInput>>()
+        var fromIndex = 0
+        while (fromIndex < segments.size) {
+            windows.add(
+                segments.subList(fromIndex, minOf(segments.size, fromIndex + 8))
+            )
+            if (fromIndex + 8 >= segments.size) break
+            fromIndex += 7
+        }
+        // v1.2.0 — eksekusi paralel: satu async per jendela.
+        // postOnce memblokir thread (OkHttp execute), jadi tiap
+        // async eksplisit di Dispatchers.IO juga.
+        val outcomes = coroutineScope {
+            windows.mapIndexed { index, windowSegments ->
+                async(Dispatchers.IO) {
+                    val assigned = index % MODELS.size
+                    // Pacing per model: jendela ke model yang sama
+                    // mulai berselisih WINDOW_DELAY_MS.
+                    val stagger = (index / MODELS.size) * WINDOW_DELAY_MS
+                    if (stagger > 0) delay(stagger)
+                    scoreWindowWithFallback(apiKey, videoTitle, windowSegments, assigned)
+                }
+            }.awaitAll()
+        }
         val merged = mutableMapOf<Int, SegmentScore>()
-        var windowsTotal = 0
         var windowsSucceeded = 0
         var windowsFailed = 0
         var lastError: String? = null
-        // Jendela dibangun dari indeks segmen, bukan label waktu teks:
-        // segmen berdurasi ~90 detik (Scoring.buildSegments), jadi
-        // 8 segmen ≈ 12 menit dan langkah 7 segmen ≈ overlap 90 detik.
-        val segmentsPerWindow = 8
-        val step = 7 // 8 segmen per jendela, maju 7 = overlap ~1 segmen (~90 dtk)
-        var fromIndex = 0
-        while (fromIndex < segments.size) {
-            val windowSegments = segments.subList(
-                fromIndex, minOf(segments.size, fromIndex + segmentsPerWindow)
-            )
-            windowsTotal++
-            try {
-                val windowScores = scoreSegments(apiKey, videoTitle, windowSegments)
-                // v1.0.8 P0-7: jendela dihitung BERHASIL hanya kalau
-                // LLM benar-benar men-skor >=1 segmen. Map kosong
-                // (scoreSegments melempar EmptyLlmScoreException)
-                // dihitung GAGAL, bukan sukses palsu.
-                if (windowScores.isEmpty()) {
-                    windowsFailed++
-                    lastError = "jendela ${windowsTotal}: LLM tidak men-skor satu pun segmen"
-                } else {
-                    for ((id, score) in windowScores) {
-                        val existing = merged[id]
-                        if (existing == null || score.score > existing.score) {
-                            merged[id] = score
-                        }
+        val modelWins = mutableMapOf<String, Int>()
+        for (outcome in outcomes) {
+            if (outcome.scores.isNotEmpty() && outcome.model != null) {
+                for ((id, score) in outcome.scores) {
+                    val existing = merged[id]
+                    if (existing == null || score.score > existing.score) {
+                        merged[id] = score
                     }
-                    windowsSucceeded++
                 }
-            } catch (e: Exception) {
+                windowsSucceeded++
+                val short = shortModelName(outcome.model)
+                modelWins[short] = (modelWins[short] ?: 0) + 1
+            } else {
                 windowsFailed++
-                lastError = e.message?.take(200)
+                lastError = outcome.error
             }
-            if (fromIndex + segmentsPerWindow >= segments.size) break
-            fromIndex += step
-            // v1.0.8 P0-2 — jeda antar jendela (pacing TPM, lihat
-            // konstanta WINDOW_DELAY_MS). Jeda sesudah tiap jendela
-            // kecuali yang terakhir.
-            kotlinx.coroutines.delay(WINDOW_DELAY_MS)
         }
-        ChunkedScoreResult(merged, windowsTotal, windowsSucceeded, windowsFailed, lastError)
+        ChunkedScoreResult(
+            merged, windows.size, windowsSucceeded, windowsFailed, lastError, modelWins
+        )
+    }
+
+    /**
+     * v1.2.0 — skor SATU jendela: coba model yang ditugaskan, lalu
+     * SEKALI model lain kalau gagal. 413 tidak di-retry (prompt yang
+     * sama akan gagal di semua model); 429 diberi jeda singkat
+     * (RETRY_429_BASE_MS) sebelum fallback.
+     */
+    private suspend fun scoreWindowWithFallback(
+        apiKey: String,
+        videoTitle: String,
+        windowSegments: List<SegmentInput>,
+        assignedModelIndex: Int
+    ): WindowOutcome {
+        val first = runCatching {
+            scoreSegmentsWithModel(
+                apiKey, videoTitle, windowSegments, MODELS[assignedModelIndex]
+            )
+        }
+        if (first.isSuccess) {
+            return WindowOutcome(first.getOrThrow(), MODELS[assignedModelIndex], null)
+        }
+        val firstError = first.exceptionOrNull()?.message?.take(200) ?: "tanpa pesan"
+        // 413 = prompt terlalu besar: akan gagal di SEMUA model dengan
+        // prompt yang sama — jangan buang token dengan retry.
+        if (firstError.startsWith("HTTP 413")) {
+            return WindowOutcome(emptyMap(), null, firstError)
+        }
+        val fallbackIndex = (assignedModelIndex + 1) % MODELS.size
+        if (firstError.startsWith("HTTP 429")) {
+            delay(RETRY_429_BASE_MS)
+        }
+        val second = runCatching {
+            scoreSegmentsWithModel(
+                apiKey, videoTitle, windowSegments, MODELS[fallbackIndex]
+            )
+        }
+        return if (second.isSuccess) {
+            WindowOutcome(second.getOrThrow(), MODELS[fallbackIndex], null)
+        } else {
+            val secondError = second.exceptionOrNull()?.message?.take(200)
+                ?: "tanpa pesan"
+            WindowOutcome(emptyMap(), null, secondError)
+        }
+    }
+
+    /**
+     * v1.2.0 — skor SATU jendela dengan SATU model tertentu (tanpa
+     * fallback antar model di dalam call — fallback ditangani di
+     * scoreWindowWithFallback). Dipakai jalur paralel; scoreSegments
+     * (rantai fallback berurutan) dipertahankan untuk pemakaian lama.
+     * Melempar IllegalStateException berisi detail HTTP (mis.
+     * "HTTP 429 ...") atau EmptyLlmScoreException kalau jawaban
+     * tidak ter-parse — TIDAK PERNAH memuat API key.
+     */
+    private suspend fun scoreSegmentsWithModel(
+        apiKey: String,
+        videoTitle: String,
+        segments: List<SegmentInput>,
+        model: String
+    ): Map<Int, SegmentScore> = withContext(Dispatchers.IO) {
+        require(apiKey.isNotBlank()) { "Isi Groq API key di Settings dulu." }
+        if (segments.isEmpty()) return@withContext emptyMap()
+        val (systemPrompt, userPrompt) = buildScoringPrompts(videoTitle, segments)
+        val body = JSONObject().apply {
+            put("model", model)
+            put("temperature", 0.4)
+            put("messages", JSONArray().apply {
+                put(JSONObject().apply {
+                    put("role", "system"); put("content", systemPrompt)
+                })
+                put(JSONObject().apply {
+                    put("role", "user"); put("content", userPrompt)
+                })
+            })
+        }
+        val outcome = postOnceDetailed(apiKey, body, model)
+        val raw = outcome.content
+            ?: throw IllegalStateException(
+                outcome.error?.take(200)
+                    ?: "Groq gagal menjawab (tanpa detail)."
+            )
+        val parsed = parseScores(raw)
+        if (parsed.isEmpty()) {
+            throw EmptyLlmScoreException(
+                "LLM tidak men-skor satu pun segmen (jawaban tidak ter-parse sebagai JSON skor)."
+            )
+        }
+        parsed
     }
 
     /**
@@ -262,12 +386,36 @@ class GroqClient(
     ): Map<Int, SegmentScore> = withContext(Dispatchers.IO) {
         require(apiKey.isNotBlank()) { "Isi Groq API key di Settings dulu." }
         if (segments.isEmpty()) return@withContext emptyMap()
+        val (systemPrompt, userPrompt) = buildScoringPrompts(videoTitle, segments)
+        val raw = callChat(apiKey, systemPrompt, userPrompt)
+        val parsed = parseScores(raw)
+        // v1.0.8 P0-7: jawaban LLM yang tidak ter-parse menjadi skor
+        // apa pun adalah KEGAGALAN window ini, bukan "sukses 0 skor".
+        // Pemanggil (scoreSegmentsChunked) menghitungnya gagal dan
+        // lanjut ke window lain — bukan diam-diam menghitung sukses.
+        if (parsed.isEmpty()) {
+            throw EmptyLlmScoreException(
+                "LLM tidak men-skor satu pun segmen (jawaban tidak ter-parse sebagai JSON skor)."
+            )
+        }
+        parsed
+    }
+
+    /**
+     * Prompt scoring (framework viralitas v1.0.7 — desain dipinjam
+     * dari AI-Youtube-Shorts-Generator highlights.py / SupoClip,
+     * prompt ditulis sendiri untuk ClipKu, BUKAN copy code mereka).
+     * Dipakai scoreSegments (rantai fallback) dan
+     * scoreSegmentsWithModel (jalur paralel) — prompt, temperatur,
+     * dan format JSON TIDAK berubah di v1.2.0.
+     */
+    private fun buildScoringPrompts(
+        videoTitle: String,
+        segments: List<SegmentInput>
+    ): Pair<String, String> {
         val segmentText = segments.joinToString("\n\n") { segment ->
             "[${segment.id}] ${segment.startLabel}-${segment.endLabel}\n${segment.text}"
         }.take(MAX_CHARS_PER_CALL)
-        // v1.0.7 — framework viralitas (desain dipinjam dari
-        // AI-Youtube-Shorts-Generator highlights.py / SupoClip, prompt
-        // ditulis sendiri untuk ClipKu, BUKAN copy code mereka):
         // hook, emotional peak, opinion bomb, revelation, conflict,
         // quotable line, story peak, practical value. Skor 0-100 +
         // hook sentence (judul) + reason, format JSON sama seperti dulu.
@@ -290,18 +438,7 @@ class GroqClient(
             yang paling menonjol.
         """.trimIndent()
         val userPrompt = "Judul video: $videoTitle\n\nSegmen:\n$segmentText"
-        val raw = callChat(apiKey, systemPrompt, userPrompt)
-        val parsed = parseScores(raw)
-        // v1.0.8 P0-7: jawaban LLM yang tidak ter-parse menjadi skor
-        // apa pun adalah KEGAGALAN window ini, bukan "sukses 0 skor".
-        // Pemanggil (scoreSegmentsChunked) menghitungnya gagal dan
-        // lanjut ke window lain — bukan diam-diam menghitung sukses.
-        if (parsed.isEmpty()) {
-            throw EmptyLlmScoreException(
-                "LLM tidak men-skor satu pun segmen (jawaban tidak ter-parse sebagai JSON skor)."
-            )
-        }
-        parsed
+        return systemPrompt to userPrompt
     }
 
     data class SegmentInput(
@@ -388,7 +525,21 @@ class GroqClient(
         )
     }
 
-    private fun postOnce(apiKey: String, body: JSONObject, model: String): String? {
+    /** Hasil satu POST Groq: konten jawaban atau pesan error (tanpa key). */
+    private data class PostOutcome(val content: String?, val error: String?)
+
+    /**
+     * v1.2.0 — varian postOnce TANPA shared state: aman dipakai dari
+     * coroutine paralel (lastError lama adalah var bersama yang akan
+     * balapan kalau ditulis 3 thread sekaligus). postOnce lama
+     * dipertahankan sebagai wrapper untuk callChat (jalur berurutan:
+     * narasi, rerank, scoreSegments).
+     */
+    private fun postOnceDetailed(
+        apiKey: String,
+        body: JSONObject,
+        model: String
+    ): PostOutcome {
         return try {
             val request = Request.Builder()
                 .url(URL)
@@ -404,8 +555,7 @@ class GroqClient(
             val text = response.body?.string() ?: ""
             response.close()
             if (!response.isSuccessful) {
-                lastError = "HTTP $code " + groqErrorText(text)
-                return null
+                return PostOutcome(null, "HTTP $code " + groqErrorText(text))
             }
             val content = JSONObject(text)
                 .optJSONArray("choices")
@@ -414,19 +564,22 @@ class GroqClient(
                 ?.optString("content", "")
                 ?: ""
             if (content.isBlank()) {
-                lastError = "HTTP $code jawaban kosong"
-                null
+                PostOutcome(null, "HTTP $code jawaban kosong")
             } else {
-                content
+                PostOutcome(content, null)
             }
         } catch (e: Exception) {
-            // Jangan menimpa detail HTTP yang sudah tercatat.
-            if (lastError == null) {
-                lastError = "jaringan/timeout: " +
-                    (e.message?.take(120) ?: "tanpa pesan")
-            }
-            null
+            PostOutcome(
+                null,
+                "jaringan/timeout: " + (e.message?.take(120) ?: "tanpa pesan")
+            )
         }
+    }
+
+    private fun postOnce(apiKey: String, body: JSONObject, model: String): String? {
+        val outcome = postOnceDetailed(apiKey, body, model)
+        lastError = outcome.error
+        return outcome.content
     }
 
     /**

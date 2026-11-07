@@ -28,6 +28,8 @@ import kotlin.math.max
  */
 object Scoring {
     const val TOP_N = 6
+    /** v1.2.0 — pre-filter: hanya Top-N segmen ini yang di-skor LLM. */
+    const val TOP_N_LLM = 12
     const val TARGET_MS = 60_000L
     const val MIN_MS = 50_000L
     const val MAX_MS = 70_000L
@@ -203,17 +205,89 @@ object Scoring {
     }
 
     /**
-     * v1.0.8 P0-1 — skor teks transkrip saja (fallback saat LLM mati
-     * DAN heatmap + audio 0). Aturan, didokumentasikan eksplisit:
-     * tiap kalimat men-skor rentang detiknya dengan nilai dasar 0.50,
+     * v1.2.0 — skor teks SATU kalimat (aturan v1.0.8 P0-1, dipakai
+     * transcriptTextPerSecond DAN pre-filter LLM): dasar 0.50,
      * +0.20 kalau mengandung '?' (kalimat tanya — momen penekanan /
      * pertanyaan retoris), +0.20 kalau mengandung '!' (seruan),
      * +0.10 kalau panjangnya 12-40 kata (kalimat substansial, bukan
-     * filler satu-dua kata). Nilai dijepit 0.0-1.0, detik yang
-     * tercakup beberapa kalimat mengambil nilai tertinggi. Ini BUKAN
-     * penilaian semantik LLM — hanya sinyal teks kasar supaya video
-     * yang transkripnya ada tidak pulang dengan tangan kosong saat
-     * Groq tidak menjawab. Kualitasnya belum terbukti di HP.
+     * filler satu-dua kata). Nilai dijepit 0.0-1.0.
+     */
+    private fun sentenceTextScore(text: String): Double {
+        var score = 0.50
+        if ('?' in text) score += 0.20
+        if ('!' in text) score += 0.20
+        val words = text.trim().split(Regex("\\s+"))
+            .count { it.isNotEmpty() }
+        if (words in 12..40) score += 0.10
+        return score.coerceIn(0.0, 1.0)
+    }
+
+    /**
+     * v1.2.0 — PRE-FILTER transcript-only (upgrade #1 riset
+     * super-cepat): skor cepat tiap segmen dari transkrip saja
+     * (aturan kalimat di atas — diambil nilai kalimat TERKUAT di
+     * dalam segmen), lalu ambil Top TOP_N_LLM = 12 segmen untuk
+     * di-skor LLM. Segmen di luar Top-12 TIDAK dibuang: mereka
+     * tetap masuk selectClips dan tetap bisa jadi clip lewat fusion
+     * heatmap/audio atau jalur transcript-only — hanya saja tanpa
+     * skor LLM. Diversifikasi waktu: tiap sepertiga video dijamin
+     * minimal 1 segmen di Top-12 (ganti segmen terlemah yang
+     * sepertiganya masih terwakili), supaya momen tenang di paruh
+     * akhir tidak hilang sistematis. Kalau segmen <= 12, semuanya
+     * lolos tanpa filter. RISIKO jujur: aturan '?'/'!' itu kasar —
+     * momen penting yang tenang bisa terbuang sebelum LLM
+     * melihatnya; Top-12 yang longgar + diversifikasi hanya
+     * mitigasi, bukan jaminan.
+     */
+    fun prefilterSegmentsForLlm(
+        segments: List<Segment>,
+        sentences: List<Sentence>
+    ): List<Segment> {
+        if (segments.size <= TOP_N_LLM) return segments
+        val sentenceByIndex = sentences.withIndex().associate { it.index to it }
+        val scored = segments.map { segment ->
+            val best = segment.sentenceIndices
+                .mapNotNull { sentenceByIndex[it] }
+                .maxOfOrNull { sentenceTextScore(it.text) } ?: 0.0
+            segment to best
+        }
+        val ranked = scored.sortedWith(
+            compareByDescending<Pair<Segment, Double>> { it.second }
+                .thenBy { it.first.startMs }
+        )
+        val picked = ranked.take(TOP_N_LLM).map { it.first }.toMutableList()
+        val durationMs = segments.maxOfOrNull { it.endMs } ?: 0L
+        if (durationMs > 0) {
+            val thirdOf = { s: Segment ->
+                ((s.startMs * 3) / durationMs).toInt().coerceIn(0, 2)
+            }
+            val pickedThirds = picked.map { thirdOf(it) }.toSet()
+            for (third in 0..2) {
+                if (third in pickedThirds) continue
+                val bestInThird = ranked.firstOrNull {
+                    it.first !in picked && thirdOf(it.first) == third
+                }?.first ?: continue
+                val scoreOf = { seg: Segment ->
+                    scored.first { it.first == seg }.second
+                }
+                val weakest = picked.minByOrNull { scoreOf(it) } ?: continue
+                if (picked.count { thirdOf(it) == thirdOf(weakest) } > 1) {
+                    picked.remove(weakest)
+                    picked.add(bestInThird)
+                }
+            }
+        }
+        return picked.sortedBy { it.startMs }
+    }
+
+    /**
+     * v1.0.8 P0-1 — skor teks transkrip saja (fallback saat LLM mati
+     * DAN heatmap + audio 0). Tiap kalimat men-skor rentang detiknya
+     * (lihat sentenceTextScore); detik yang tercakup beberapa kalimat
+     * mengambil nilai tertinggi. Ini BUKAN penilaian semantik LLM —
+     * hanya sinyal teks kasar supaya video yang transkripnya ada
+     * tidak pulang dengan tangan kosong saat Groq tidak menjawab.
+     * Kualitasnya belum terbukti di HP.
      */
     private fun transcriptTextPerSecond(
         sentences: List<Sentence>,
@@ -221,13 +295,7 @@ object Scoring {
     ): DoubleArray {
         val out = DoubleArray(durationSec) { 0.0 }
         for (sentence in sentences) {
-            var score = 0.50
-            if ('?' in sentence.text) score += 0.20
-            if ('!' in sentence.text) score += 0.20
-            val words = sentence.text.trim().split(Regex("\\s+"))
-                .count { it.isNotEmpty() }
-            if (words in 12..40) score += 0.10
-            score = score.coerceIn(0.0, 1.0)
+            val score = sentenceTextScore(sentence.text)
             val from = (sentence.startMs / 1000).toInt().coerceIn(0, durationSec - 1)
             val to = (sentence.endMs / 1000).toInt().coerceIn(0, durationSec - 1)
             for (second in from..to) {
