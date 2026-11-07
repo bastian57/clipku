@@ -244,7 +244,7 @@ object Scoring {
         sentences: List<Sentence>
     ): List<Segment> {
         if (segments.size <= TOP_N_LLM) return segments
-        val sentenceByIndex = sentences.withIndex().associate { it.index to it }
+        val sentenceByIndex = sentences.withIndex().associate { it.index to it.value }
         val scored = segments.map { segment ->
             val best = segment.sentenceIndices
                 .mapNotNull { sentenceByIndex[it] }

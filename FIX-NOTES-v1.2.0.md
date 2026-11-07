@@ -1,3 +1,22 @@
+# ClipKu v1.2.0 — fix1 (build merah pertama)
+
+Build pertama (run 42350658322, commit e35d806) MERAH di `compileDebugKotlin`,
+3 error — semuanya dari code v1.2.0 baru, bukan infra (langkah 1-6 hijau,
+exit code 2, sama seperti merah v1.0.7):
+- `GroqClient.kt:204 Unresolved reference: awaitAll` — import
+  `kotlinx.coroutines.awaitAll` ketinggalan (klaim "semua import ada" di
+  laporan build ternyata salah — `async`/`coroutineScope`/`delay` ada,
+  `awaitAll` tidak).
+- `GroqClient.kt:211 For-loop range must have an 'iterator()' method` —
+  efek turunan dari error yang sama (`outcomes` bertipe error karena
+  `awaitAll` tak ter-resolve, jadi `for (outcome in outcomes)` ikut gagal).
+- `Scoring.kt:251 Unresolved reference: text` — `sentences.withIndex()
+  .associate { it.index to it }` menghasilkan `Map<Int, IndexedValue>`
+  (bukan `Map<Int, Sentence>`), jadi `.text` tidak ada. Fix: `it.value`.
+
+Fix1 (2 baris, versi TETAP 1.2.0/vc12): tambah import `awaitAll` +
+`it.index to it.value`. Tidak ada perubahan perilaku.
+
 # ClipKu v1.2.0 — Upgrade #1 riset super-cepat: pre-filter + scoring paralel 3 model
 
 ## Yang berubah (3 file + versi)
