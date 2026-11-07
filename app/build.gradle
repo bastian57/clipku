@@ -69,7 +69,13 @@ dependencies {
     // jadi muxer default sejak 1.9.0 — tidak ada perubahan code
     // Transformer yang dipaksa API ini.
     def media3Version = '1.9.0'
-    def roomVersion = '2.8.5'
+    // fix2 (2026-11-07): Room 2.8.5 -> 2.6.1. POM 2.8.5 menarik
+    // kotlin-stdlib 2.1.20 (metadata 2.1.0) yang TIDAK BISA dibaca
+    // compiler Kotlin 1.9.25 (mentok metadata 2.0.0) -> 1358 error
+    // "Unresolved reference" di semua file. 2.6.1 tidak menarik
+    // stdlib 2.x (POM-nya tanpa kotlin-stdlib) dan cocok dengan
+    // Kotlin 1.9.25 + kapt. History cuma pakai API Room standar.
+    def roomVersion = '2.6.1'
     implementation platform("androidx.compose:compose-bom:$composeBom")
     implementation 'androidx.compose.ui:ui'
     implementation 'androidx.compose.ui:ui-graphics'
@@ -89,7 +95,7 @@ dependencies {
     implementation "androidx.media3:media3-ui:$media3Version"
     implementation "androidx.media3:media3-common:$media3Version"
 
-    // v1.3.0 History: Room 2.8.5 (stabil 9 Sep 2026) via KAPT.
+    // v1.3.0 History: Room 2.6.1 via KAPT (fix2: 2.8.5 -> 2.6.1).
     implementation "androidx.room:room-runtime:$roomVersion"
     implementation "androidx.room:room-ktx:$roomVersion"
     kapt "androidx.room:room-compiler:$roomVersion"

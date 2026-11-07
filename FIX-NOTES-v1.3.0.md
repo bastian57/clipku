@@ -5,6 +5,18 @@
 **Perintah:** "Gas semua langsung, mau apk final" — semua sisa upgrade (#2, #3, #4, #5) + History Analisa masuk SATU build ini, menggantikan pola satu-versi-per-upgrade.
 **Yang TIDAK diubah:** keystore/signing, perilaku #1 (pre-filter Top-12 + scoring paralel 3 model), download/segment HandlerThread v1.1.0, narasi, Whisper.
 
+## fix2 (2026-11-07 22:42 WIB, asisten langsung) — Room 2.8.5 → 2.6.1 + factory EditedMediaItemSequence
+
+**Run merah:** 42386311501 (head 5ddcc19, fix1), `BUILD FAILED in 2m 56s`, `:app:compileDebugKotlin FAILED` — **1358 error**. Baris penentu:
+
+> `Class 'kotlin.Unit' was compiled with an incompatible version of Kotlin. The actual metadata version is 2.1.0, but the compiler version 1.9.0 can read versions up to 2.0.0. The class is loaded from .../kotlin-stdlib/2.1.20/.../kotlin-stdlib-2.1.20.jar`
+
+**Akar 1 (1350+ error):** Room 2.8.5 menarik `kotlin-stdlib 2.1.20` (terverifikasi dari POM resmi Google Maven) — stdlib-nya tidak bisa dibaca compiler Kotlin 1.9.25, sehingga SEMUA simbol stdlib (`listOf`, `trim`, `Regex`, `resume`, `copyTo`, dst.) jadi "Unresolved reference" di semua file. Media3 1.9.0 BUKAN pelakunya (POM-nya pakai kotlin-bom 1.8.0). Room 2.7.0 juga menarik stdlib 2.1.10; **Room 2.6.1 POM-nya tidak mendeklarasikan kotlin-stdlib sama sekali** → turun ke 2.6.1. History cuma pakai API Room standar (`@Entity/@Dao/@Database/@Query/@Insert/@Delete`), tidak ada yang butuh 2.7/2.8.
+
+**Akar 2 (nyata, bukan kaskade):** `EditedMediaItemSequence(EditedMediaItem...)` — konstruktornya jadi **private di media3 1.9.0** (di 1.4.1 masih publik; di docs resmi 1.11 sudah tidak ada konstruktor publik — hanya `Builder` + factory `withAudioAndVideoFrom/withAudioFrom/withVideoFrom`). Dua titik diperbaiki: `CuttingEngine.kt` (cutWithTransformer) dan `SegmentExport.kt` (transformRemote) sekarang pakai `EditedMediaItemSequence.withAudioAndVideoFrom(listOf(...))` — audio+video, sama seperti perilaku lama. Error `Transformer.start(...) ambiguity` di log kemungkinan kaskade dari dua akar di atas (tipe `composition` gagal ter-resolve); kalau masih muncul di run berikutnya, itu yang dicek duluan.
+
+**Fix:** `roomVersion = '2.6.1'` + 2 titik factory di atas. Versi tetap 1.3.0/vc13. Jujur: kompilasi lokal tidak bisa dicek (tanpa Java di VM) — gerbangnya tetap Actions; kalau fix2 masih merah, log berikutnya yang bicara.
+
 ## fix1 (2026-11-07 21:31 WIB, asisten langsung) — media3 1.11.1 → 1.9.0
 
 **Run merah:** 42381411781 (head e40c95a), `BUILD FAILED in 42s`, `:app:checkDebugAarMetadata FAILED` — 11 issue, semua artefak media3 1.11.1: *"requires libraries and applications that depend on it to compile against version 36 or later of the Android APIs. :app is currently compiled against android-35. Also, the maximum recommended compile SDK version for Android Gradle plugin 8.7.3 is 35."*

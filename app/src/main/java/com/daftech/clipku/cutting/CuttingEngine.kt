@@ -99,8 +99,10 @@ object CuttingEngine {
             .build()
         val composition = Composition.Builder(
             listOf(
-                EditedMediaItemSequence(
-                    EditedMediaItem.Builder(mediaItem).build()
+                // fix2 (2026-11-07): ctor EditedMediaItemSequence(...) jadi
+                // private di media3 1.9.0 — pakai factory withAudioAndVideoFrom.
+                EditedMediaItemSequence.withAudioAndVideoFrom(
+                    listOf(EditedMediaItem.Builder(mediaItem).build())
                 )
             )
         ).build()

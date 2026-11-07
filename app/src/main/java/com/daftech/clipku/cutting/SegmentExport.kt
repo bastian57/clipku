@@ -241,7 +241,12 @@ object SegmentExport {
         handler.post {
             try {
                 val sequences = items.map { item ->
-                    EditedMediaItemSequence(EditedMediaItem.Builder(item).build())
+                    // fix2 (2026-11-07): ctor EditedMediaItemSequence(...)
+                    // jadi private di media3 1.9.0 — pakai factory
+                    // withAudioAndVideoFrom (audio+video, sama seperti dulu).
+                    EditedMediaItemSequence.withAudioAndVideoFrom(
+                        listOf(EditedMediaItem.Builder(item).build())
+                    )
                 }
                 val composition = Composition.Builder(sequences).build()
                 val transformer = Transformer.Builder(context)
