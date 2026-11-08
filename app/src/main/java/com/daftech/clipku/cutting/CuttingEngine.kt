@@ -142,6 +142,12 @@ object CuttingEngine {
      * Salin track video (+ audio kalau [audioFile] diberikan, atau dari
      * file yang sama kalau null) yang timestamp-nya di dalam rentang,
      * ke MP4 baru via MediaMuxer.
+     *
+     * v1.4.0 (P2-6): kondisi mati `if (audioFile != null || true)`
+     * DIHAPUS (selalu benar — audio selalu dicoba dari audioFile
+     * atau videoFile yang sama). videoExtractor DAN audioExtractor
+     * kini masing-masing di-release di finally sendiri, supaya
+     * copyTrack yang melempar di tengah tidak membocorkan extractor.
      */
     private fun muxTrim(
         videoFile: File,
@@ -154,33 +160,33 @@ object CuttingEngine {
         val startUs = startMs * 1000L
         val endUs = endMs * 1000L
         val muxer = MediaMuxer(output.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        val videoExtractor = MediaExtractor()
+        var audioExtractor: MediaExtractor? = null
         try {
-            val videoExtractor = MediaExtractor()
             videoExtractor.setDataSource(videoFile.absolutePath)
             val videoTrack = selectTrack(videoExtractor, "video/")
                 ?: throw IllegalStateException("Track video tidak ditemukan")
             val videoFormat = videoExtractor.getTrackFormat(videoTrack)
             val outVideoTrack = muxer.addTrack(videoFormat)
 
-            var audioExtractor: MediaExtractor? = null
             var audioTrack = -1
             var outAudioTrack = -1
-            var audioFormat: MediaFormat? = null
             val audioSource = audioFile ?: videoFile
-            if (audioFile != null || true) {
-                try {
-                    val extractor = MediaExtractor()
-                    extractor.setDataSource(audioSource.absolutePath)
-                    val found = selectTrack(extractor, "audio/")
-                    if (found != null) {
-                        audioExtractor = extractor
-                        audioTrack = found
-                        audioFormat = extractor.getTrackFormat(found)
-                        outAudioTrack = muxer.addTrack(audioFormat)
-                    }
-                } catch (e: Exception) {
-                    audioExtractor = null
+            val audioCandidate = MediaExtractor()
+            try {
+                audioCandidate.setDataSource(audioSource.absolutePath)
+                val found = selectTrack(audioCandidate, "audio/")
+                if (found != null) {
+                    audioExtractor = audioCandidate
+                    audioTrack = found
+                    val audioFormat = audioCandidate.getTrackFormat(found)
+                    outAudioTrack = muxer.addTrack(audioFormat)
+                } else {
+                    audioCandidate.release()
                 }
+            } catch (e: Exception) {
+                try { audioCandidate.release() } catch (e2: Exception) { /* abaikan */ }
+                audioExtractor = null
             }
 
             muxer.start()
@@ -189,10 +195,10 @@ object CuttingEngine {
                 copyTrack(audioExtractor, audioTrack, muxer, outAudioTrack, startUs, endUs, false)
             }
             muxer.stop()
-            videoExtractor.release()
-            audioExtractor?.release()
             return output.exists() && output.length() > 0
         } finally {
+            try { videoExtractor.release() } catch (e: Exception) { /* abaikan */ }
+            try { audioExtractor?.release() } catch (e: Exception) { /* abaikan */ }
             try { muxer.release() } catch (e: Exception) { /* abaikan */ }
         }
     }

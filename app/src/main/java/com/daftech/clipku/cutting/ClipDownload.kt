@@ -59,6 +59,14 @@ object ClipDownload {
     private const val SEGMENT_TIMEOUT_MS = 180_000L
     /** Batas waktu percobaan segmen audio-only untuk Whisper. */
     private const val SEGMENT_AUDIO_TIMEOUT_MS = 120_000L
+    /**
+     * v1.4.0 (P1-3): batas TOTAL cache sumber (clipku-source).
+     * File sumber penuh per video menumpuk tanpa batas sejak v1.0.5;
+     * kini totalnya dibatasi 500 MB dengan eviksi LRU (file sumber
+     * tertua dihapus dulu) + tombol "Bersihkan Cache" di Settings.
+     * History Room TIDAK ikut dihapus — hanya file sumber video.
+     */
+    const val MAX_SOURCE_CACHE_BYTES = 500L * 1024L * 1024L
 
     /** Hasil download clip + jalur ekspor yang benar-benar dipakai. */
     data class DownloadResult(
@@ -70,7 +78,13 @@ object ClipDownload {
          * akhirnya jatuh ke full-download. Null kalau segmen berhasil
          * atau tidak sempat dicoba.
          */
-        val segmentFailureReason: String? = null
+        val segmentFailureReason: String? = null,
+        /**
+         * v1.4.0 (P1-1): durasi AKTUAL file clip hasil potong (ms,
+         * dari MediaExtractor) — ukuran jujur pengganti klaim byte
+         * yang tidak bisa diukur Transformer. Null kalau tidak terbaca.
+         */
+        val actualDurationMs: Long? = null
     )
 
     /**
@@ -182,6 +196,115 @@ object ClipDownload {
     }
 
     /**
+     * v1.4.0 (P1-3): total ukuran cache sumber (clipku-source).
+     * Dipakai Settings untuk menampilkan ukuran + tombol bersih-bersih.
+     */
+    fun sourceCacheSizeBytes(context: Context): Long {
+        val dir = File(context.cacheDir, "clipku-source")
+        if (!dir.exists()) return 0L
+        return dir.listFiles()?.sumOf { it.length() } ?: 0L
+    }
+
+    /**
+     * v1.4.0 (P1-3): hapus SEMUA file sumber cache, kembalikan byte
+     * yang dibebaskan. Dipakai tombol "Bersihkan Cache" di Settings.
+     * File hasil potong (clipku-cut-*) dan temp Whisper TIDAK ikut —
+     * hanya sumber video di clipku-source.
+     */
+    fun clearSourceCache(context: Context): Long {
+        val dir = File(context.cacheDir, "clipku-source")
+        if (!dir.exists()) return 0L
+        var freed = 0L
+        dir.listFiles()?.forEach { file ->
+            freed += file.length()
+            try { file.delete() } catch (e: Exception) { /* abaikan */ }
+        }
+        return freed
+    }
+
+    /**
+     * v1.4.0 (P1-3): eviksi LRU cache sumber sampai total <= batas.
+     * File tertua (lastModified) dihapus dulu. Dipanggil di awal
+     * downloadClipDetailed/cutClipToTemp — SEBELUM file sumber baru
+     * ditambahkan — supaya cache tidak tumbuh tanpa batas.
+     */
+    private fun enforceSourceCacheLimit(context: Context) {
+        val dir = File(context.cacheDir, "clipku-source")
+        if (!dir.exists()) return
+        val files = dir.listFiles()?.sortedBy { it.lastModified() } ?: return
+        var total = files.sumOf { it.length() }
+        for (file in files) {
+            if (total <= MAX_SOURCE_CACHE_BYTES) break
+            total -= file.length()
+            try { file.delete() } catch (e: Exception) { /* abaikan */ }
+        }
+    }
+
+    /**
+     * v1.4.0 (P1-1): durasi aktual file media (ms) via MediaExtractor,
+     * null kalau tidak terbaca. Dipakai DownloadResult supaya
+     * diagnostik + kartu clip menampilkan durasi YANG BENAR-BENAR
+     * dihasilkan, bukan durasi yang diminta.
+     */
+    private fun actualDurationMs(file: File): Long? {
+        if (!file.exists() || file.length() <= 0L) return null
+        val extractor = android.media.MediaExtractor()
+        return try {
+            extractor.setDataSource(file.absolutePath)
+            var durationUs = -1L
+            for (i in 0 until extractor.trackCount) {
+                try {
+                    val d = extractor.getTrackFormat(i)
+                        .getLong(android.media.MediaFormat.KEY_DURATION)
+                    if (d > 0) {
+                        durationUs = d
+                        break
+                    }
+                } catch (e: Exception) { /* format tanpa durasi */ }
+            }
+            if (durationUs > 0) durationUs / 1000L else null
+        } catch (e: Exception) {
+            null
+        } finally {
+            try { extractor.release() } catch (e: Exception) { /* abaikan */ }
+        }
+    }
+
+    /**
+     * v1.4.0 (P2-4): nama file unik di Downloads/ClipKu — kalau nama
+     * sudah ada (download clip yang sama berulang), tambahkan suffix
+     * angka ("..._2.mp4", "..._3.mp4") supaya tidak timpa diam-diam
+     * dan tidak duplikat diam-diam. Cek via MediaStore (nama tampil)
+     * + file fallback.
+     */
+    private fun uniqueDownloadName(context: Context, fileName: String): String {
+        if (!downloadNameExists(context, fileName)) return fileName
+        val base = fileName.removeSuffix(".mp4")
+        var n = 2
+        while (n <= 99) {
+            val candidate = "${base}_$n.mp4"
+            if (!downloadNameExists(context, candidate)) return candidate
+            n++
+        }
+        return "${base}_${System.currentTimeMillis()}.mp4"
+    }
+
+    private fun downloadNameExists(context: Context, name: String): Boolean {
+        return try {
+            val cursor = context.contentResolver.query(
+                MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                arrayOf(MediaStore.Downloads._ID),
+                "${MediaStore.Downloads.DISPLAY_NAME} = ?",
+                arrayOf(name),
+                null
+            )
+            cursor?.use { it.count > 0 } ?: false
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /**
      * Unduh stream ke [target]. Mengembalikan hasil + alasan gagal.
      * v1.0.9: request KINI mengirim User-Agent browser + Referer
      * YouTube (sama seperti AudioEnergy) — request polos tanpa header
@@ -237,13 +360,21 @@ object ClipDownload {
         info: VideoInfo,
         clip: Clip
     ): DownloadResult = withContext(Dispatchers.IO) {
+        // v1.4.0 (P1-3): eviksi LRU dulu — cache tidak boleh tumbuh
+        // tanpa batas sebelum sumber baru ditambahkan.
+        enforceSourceCacheLimit(context)
         val cacheDir = File(context.cacheDir, "clipku-source").apply { mkdirs() }
         val safeTitle = info.title
             .replace(Regex("[^A-Za-z0-9 _-]"), "")
             .trim()
             .take(40)
             .ifEmpty { "clip" }
-        val fileName = "%02d_%s.mp4".format(clip.index, safeTitle.replace(' ', '-'))
+        // v1.4.0 (P2-4): nama final unik — download ulang clip yang
+        // sama tidak menimpa / menduplikasi diam-diam di Downloads.
+        val fileName = uniqueDownloadName(
+            context,
+            "%02d_%s.mp4".format(clip.index, safeTitle.replace(' ', '-'))
+        )
 
         val cutFile = File(context.cacheDir, "clipku-cut-$fileName")
         if (cutFile.exists()) cutFile.delete()
@@ -280,8 +411,12 @@ object ClipDownload {
             false
         }
         if (segmentOk && cutFile.exists() && cutFile.length() > 0L) {
+            // Durasi dibaca SEBELUM saveToDownloads (yang menghapus
+            // cutFile setelah menyalin) — kalau dibalik, selalu null.
+            val actualMs = actualDurationMs(cutFile)
             return@withContext DownloadResult(
-                saveToDownloads(context, cutFile, fileName), "segment"
+                saveToDownloads(context, cutFile, fileName), "segment",
+                actualDurationMs = actualMs
             )
         }
         try { cutFile.delete() } catch (e: Exception) { /* abaikan */ }
@@ -342,10 +477,13 @@ object ClipDownload {
         if (!ok || !cutFile.exists() || cutFile.length() == 0L) {
             throw IllegalStateException("Gagal memotong clip. Coba lagi.")
         }
+        // Durasi dibaca SEBELUM saveToDownloads (lihat lapis segmen).
+        val actualMs = actualDurationMs(cutFile)
         DownloadResult(
             saveToDownloads(context, cutFile, fileName),
             "full-download",
-            segmentFailureReason = segmentReason
+            segmentFailureReason = segmentReason,
+            actualDurationMs = actualMs
         )
     }
 
@@ -376,12 +514,22 @@ object ClipDownload {
      * itu — biaya yang sama seperti satu tap Download — tapi yang
      * dikirim ke Whisper tetap hanya file clip ~60 detik ini, bukan
      * video utuh).
+     * v1.4.0 (P1-4): [audioUrlOverride] — URL audio hasil re-pick
+     * (saat Whisper mendeteksi bahasa berbeda). Kalau diisi, jalur
+     * segmen audio DAN fallback potong-penuh memakai URL itu, bukan
+     * URL analisa/fresh. v1.4.0 (P1-11): [onProgress] dipanggil
+     * dengan tahap yang sedang berjalan ("memotong audio clip…" /
+     * "mengunduh audio clip…") supaya UI narasi tidak diam.
      */
     suspend fun cutClipToTemp(
         context: Context,
         info: VideoInfo,
-        clip: Clip
+        clip: Clip,
+        audioUrlOverride: String? = null,
+        onProgress: ((String) -> Unit)? = null
     ): File? = withContext(Dispatchers.IO) {
+        // v1.4.0 (P1-3): eviksi LRU dulu, seperti downloadClip.
+        enforceSourceCacheLimit(context)
         val cacheDir = File(context.cacheDir, "clipku-source").apply { mkdirs() }
         val temp = File(context.cacheDir, "clipku-whisper-${info.videoId}-${clip.index}.mp4")
         if (temp.exists()) temp.delete()
@@ -398,7 +546,11 @@ object ClipDownload {
         // video. Coba dulu segmen audio-only dari URL fresh (tanpa
         // mengunduh video utuh sama sekali). Gagal = jatuh ke jalur
         // potong-penuh di bawah, seperti dulu.
-        val freshAudio = fresh.audioUrl ?: info.stream.audioUrl
+        // v1.4.0 (P1-4): override re-pick menang atas URL fresh.
+        val freshAudio = audioUrlOverride
+            ?: fresh.audioUrl
+            ?: info.stream.audioUrl
+        onProgress?.invoke("memotong audio clip…")
         val audioSegmentOk = try {
             withTimeoutOrNull(SEGMENT_AUDIO_TIMEOUT_MS) {
                 SegmentExport.trySegmentAudio(
@@ -412,6 +564,10 @@ object ClipDownload {
             return@withContext temp
         }
         try { temp.delete() } catch (e: Exception) { /* abaikan */ }
+        // v1.4.0 (P1-11): tahap ini baru terlihat — fallback
+        // potong-penuh mengunduh sumber dulu (bisa bermenit-menit
+        // untuk video panjang), jangan diam tanpa status.
+        onProgress?.invoke("mengunduh audio clip…")
         // v1.0.8 P0-5: cache sumber divalidasi isinya (lihat lapis 2).
         val ok = if (fresh.progressiveUrl != null) {
             val source = File(cacheDir, "source-${info.videoId}.mp4")
@@ -421,7 +577,7 @@ object ClipDownload {
                 }
             }
             CuttingEngine.cutProgressive(context, source, clip.startMs, clip.endMs, temp)
-        } else if (fresh.videoOnlyUrl != null && fresh.audioUrl != null) {
+        } else if (fresh.videoOnlyUrl != null && freshAudio != null) {
             val videoFile = File(cacheDir, "source-${info.videoId}-video.mp4")
             val audioFile = File(cacheDir, "source-${info.videoId}-audio")
             if (!isValidCachedSource(videoFile)) {
@@ -430,7 +586,7 @@ object ClipDownload {
                 }
             }
             if (!isValidCachedSource(audioFile)) {
-                if (!downloadToFile(fresh.audioUrl, audioFile).ok) {
+                if (!downloadToFile(freshAudio, audioFile).ok) {
                     return@withContext null
                 }
             }

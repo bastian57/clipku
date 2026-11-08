@@ -55,19 +55,51 @@ class WhisperClient(
         // Whisper tidak boleh gagal hanya karena User-Agent default.
         private const val BROWSER_UA =
             "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
+        /**
+         * v1.4.0 (P1-11): batas upload Groq Whisper — file clip dicek
+         * SEBELUM dikirim, bukan sesudah ditolak 413. Clip ~60 detik
+         * 720p biasanya 5-15 MB; 25 MB adalah batas keras Groq.
+         */
+        const val MAX_UPLOAD_BYTES = 25L * 1024L * 1024L
     }
+
+    /**
+     * v1.4.0 (P1-4): hasil transkrip + bahasa yang terdeteksi
+     * Whisper (kode 2 huruf, mis. "id"/"en", null kalau tidak
+     * terbaca). Dipakai ViewModel untuk cross-check: kalau bahasa
+     * terdeteksi berbeda dari bahasa yang diharapkan (caption),
+     * track audio dipilih ulang sekali + peringatan ditampilkan.
+     */
+    data class WhisperResult(val text: String, val language: String?)
 
     /** Transkrip teks polos dari [audioFile] (file clip ~60 detik). */
     suspend fun transcribe(apiKey: String, audioFile: File): String =
+        transcribeDetailed(apiKey, audioFile).text
+
+    /**
+     * Transkrip + bahasa terdeteksi. response_format verbose_json
+     * mengembalikan {"text": "...", "language": "indonesian"} —
+     * nama bahasa lengkap (bukan kode), jadi dinormalisasi ke kode
+     * 2 huruf di sini. File >25 MB ditolak SEBELUM upload dengan
+     * pesan jelas (P1-11), bukan sesudah Groq menjawab 413.
+     */
+    suspend fun transcribeDetailed(apiKey: String, audioFile: File): WhisperResult =
         withContext(Dispatchers.IO) {
             require(apiKey.isNotBlank()) { "Isi Groq API key di Settings dulu." }
             require(audioFile.exists() && audioFile.length() > 0) {
                 "File clip untuk transkrip tidak ditemukan."
             }
+            if (audioFile.length() > MAX_UPLOAD_BYTES) {
+                val mb = audioFile.length() / (1024 * 1024)
+                throw IllegalStateException(
+                    "File clip $mb MB melebihi batas 25 MB Whisper — " +
+                        "narasi tidak dibuat. Coba clip lain."
+                )
+            }
             val body = MultipartBody.Builder()
                 .setType(MultipartBody.FORM)
                 .addFormDataPart("model", MODEL)
-                .addFormDataPart("response_format", "json")
+                .addFormDataPart("response_format", "verbose_json")
                 .addFormDataPart(
                     "file",
                     "clip.mp4",
@@ -101,6 +133,33 @@ class WhisperClient(
                         "). Periksa Groq API key di Settings, kuota, dan koneksi internet."
                 )
             }
-            JSONObject(text).optString("text", "").trim()
+            val json = try {
+                JSONObject(text)
+            } catch (e: Exception) {
+                JSONObject()
+            }
+            WhisperResult(
+                text = json.optString("text", "").trim(),
+                language = normaliseDetectedLanguage(json.optString("language", ""))
+            )
         }
+
+    /**
+     * "indonesian"/"english"/kode 2 huruf -> "id"/"en"/... Null
+     * kalau tidak dikenal / kosong. Whisper verbose_json memakai
+     * nama lengkap bahasa Inggris; kode Java lama "in" ikut
+     * dinormalisasi ke "id".
+     */
+    private fun normaliseDetectedLanguage(raw: String): String? {
+        val lower = raw.trim().lowercase()
+        if (lower.isBlank()) return null
+        return when (lower) {
+            "indonesian", "indonesia", "in", "id" -> "id"
+            "english", "en" -> "en"
+            "javanese", "jv" -> "jv"
+            "sundanese", "su" -> "su"
+            "malay", "melayu", "ms" -> "ms"
+            else -> lower.take(2).takeIf { it.length == 2 }
+        }
+    }
 }

@@ -10,6 +10,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -64,6 +65,16 @@ class InnertubeClient(
         // sekaligus (rate limit IP), maks 12 track total per sumber.
         private const val MAX_PARALLEL_TRACKS = 4
         private const val MAX_TRACKS_TO_TRY = 12
+        /**
+         * v1.4.0 (P1-8): batas TOTAL tahap transkrip (semua sumber:
+         * WEB + TIMEDTEXT + ANDROID). Dulu ~50 track x 30 detik
+         * berurutan bisa menggantung bermenit-menit; v1.3.0 sudah
+         * memaralelkan (maks 4, maks 12 track), tapi tetap tanpa
+         * batas total. 120 detik cukup untuk 3 batch x 30 detik +
+         * timedtext + android; lebih dari itu = berhenti jujur,
+         * bukan macet tanpa progres.
+         */
+        const val TRANSCRIPT_TOTAL_TIMEOUT_MS = 120_000L
     }
 
     /** Cache respons ANDROID dari merge stream, dipakai ulang oleh fallback transkrip. */
@@ -71,6 +82,10 @@ class InnertubeClient(
 
     /** v1.0.3: jumlah track caption yang dicoba pada fetchTranscriptWithFallback terakhir. */
     var lastTracksTried: Int = 0
+        private set
+
+    /** v1.4.0 (P1-8): true kalau tahap transkrip terakhir kehabisan batas total 120 detik. */
+    var lastTranscriptTimedOut: Boolean = false
         private set
 
     /**
@@ -365,7 +380,13 @@ class InnertubeClient(
         }
     }
 
-    /** "id, default (Bahasa Indonesia)" / "en, non-default (English)" / "?, non-default". */
+    /** "id, default (Bahasa Indonesia, Innertube — belum tentu original)" /
+     * "en, non-default (English, Innertube — belum tentu original)" /
+     * "?, non-default (Innertube — belum tentu original)".
+     * v1.4.0 (P1-5): label Innertube TIDAK LAGI tampil seolah
+     * setara dengan "original" NewPipe — "default" Innertube hanya
+     * berarti track bawaan YouTube, BUKAN bukti track original.
+     */
     private fun describeInnertubeAudio(
         lang: String?,
         isDefault: Boolean,
@@ -374,9 +395,9 @@ class InnertubeClient(
         val langText = lang ?: "?"
         val typeText = if (isDefault) "default" else "non-default"
         return if (displayName.isNotBlank() && displayName.lowercase() != langText) {
-            "$langText, $typeText ($displayName)"
+            "$langText, $typeText ($displayName, Innertube — belum tentu original)"
         } else {
-            "$langText, $typeText"
+            "$langText, $typeText (Innertube — belum tentu original)"
         }
     }
 
@@ -412,32 +433,49 @@ class InnertubeClient(
      * 3. ANDROID — captionTracks dari player ANDROID, format VTT.
      * Tiap langkah yang gagal / kosong tidak melempar; hasil kosong
      * mengembalikan sumber "NONE" supaya diagnostik bisa menyebutnya.
+     * v1.4.0 (P1-8): SELURUH rantai dibatasi TRANSCRIPT_TOTAL_TIMEOUT_MS
+     * (120 detik). Timeout = hasil kosong + lastTranscriptTimedOut =
+     * true (ViewModel menulisnya di diagnostik) — bukan gantung.
      */
     suspend fun fetchTranscriptWithFallback(info: VideoInfo): TranscriptResult =
         withContext(Dispatchers.IO) {
             lastTracksTried = 0
-            val web = fetchTranscriptFromTracks(info.captionTracks)
-            if (web.isNotEmpty()) {
-                return@withContext TranscriptResult(web, "WEB")
+            lastTranscriptTimedOut = false
+            val result = withTimeoutOrNull(TRANSCRIPT_TOTAL_TIMEOUT_MS) {
+                fetchTranscriptChain(info)
             }
-            val timedtextId = fetchTimedtext(info.videoId, "id")
-            if (timedtextId.isNotEmpty()) {
-                return@withContext TranscriptResult(timedtextId, "TIMEDTEXT")
+            if (result == null) {
+                lastTranscriptTimedOut = true
+                TranscriptResult(emptyList(), "NONE")
+            } else {
+                result
             }
-            val timedtextEn = fetchTimedtext(info.videoId, "en")
-            if (timedtextEn.isNotEmpty()) {
-                return@withContext TranscriptResult(timedtextEn, "TIMEDTEXT")
-            }
-            val androidInfo = cachedAndroidInfo ?: fetchAndroidVideoInfo(info.videoId)
-            if (androidInfo != null) {
-                cachedAndroidInfo = androidInfo
-                val android = fetchTranscriptFromTracks(androidInfo.captionTracks)
-                if (android.isNotEmpty()) {
-                    return@withContext TranscriptResult(android, "ANDROID")
-                }
-            }
-            TranscriptResult(emptyList(), "NONE")
         }
+
+    /** Rantai WEB -> TIMEDTEXT -> ANDROID (tanpa batas waktu; dibungkus pemanggil). */
+    private suspend fun fetchTranscriptChain(info: VideoInfo): TranscriptResult {
+        val web = fetchTranscriptFromTracks(info.captionTracks)
+        if (web.isNotEmpty()) {
+            return TranscriptResult(web, "WEB")
+        }
+        val timedtextId = fetchTimedtext(info.videoId, "id")
+        if (timedtextId.isNotEmpty()) {
+            return TranscriptResult(timedtextId, "TIMEDTEXT")
+        }
+        val timedtextEn = fetchTimedtext(info.videoId, "en")
+        if (timedtextEn.isNotEmpty()) {
+            return TranscriptResult(timedtextEn, "TIMEDTEXT")
+        }
+        val androidInfo = cachedAndroidInfo ?: fetchAndroidVideoInfo(info.videoId)
+        if (androidInfo != null) {
+            cachedAndroidInfo = androidInfo
+            val android = fetchTranscriptFromTracks(androidInfo.captionTracks)
+            if (android.isNotEmpty()) {
+                return TranscriptResult(android, "ANDROID")
+            }
+        }
+        return TranscriptResult(emptyList(), "NONE")
+    }
 
     /**
      * v1.3.0 (#3): coba track PARALEL, bukan berurutan (P1-8: dulu
@@ -548,6 +586,11 @@ class InnertubeClient(
             val text = response.body?.string() ?: ""
             response.close()
             if (!response.isSuccessful || text.isBlank()) null else text
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // v1.4.0 (P1-8): pembatalan (timeout total / tombol Batal)
+            // WAJIB diteruskan — menelannya membuat withTimeoutOrNull
+            // tidak pernah selesai dan analisa menggantung.
+            throw e
         } catch (e: Exception) {
             null
         }

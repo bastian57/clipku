@@ -59,6 +59,21 @@ fun SettingsScreen(
             singleLine = true,
             visualTransformation = PasswordVisualTransformation()
         )
+        // v1.4.0 (P2-3): status simpan key — dulu teks di field bisa
+        // berbeda dari yang tersimpan tanpa tanda apa pun, sehingga
+        // key baru dikira sudah aktif padahal belum ditekan "Simpan".
+        if (viewModel.groqKey.trim() != viewModel.groqKeySaved.trim()) {
+            Text(
+                text = "Belum disimpan — tekan \"Simpan Key\" supaya key " +
+                    "ini yang dipakai analisa dan narasi.",
+                style = MaterialTheme.typography.bodyMedium
+            )
+        } else if (viewModel.groqKey.isNotBlank()) {
+            Text(
+                text = "Key tersimpan.",
+                style = MaterialTheme.typography.bodySmall
+            )
+        }
         Button(
             onClick = { viewModel.saveGroqKey() },
             modifier = Modifier.fillMaxWidth()
@@ -78,6 +93,27 @@ fun SettingsScreen(
             text = "Tanpa key, ClipKu tetap bisa menganalisa dengan " +
                 "heatmap + energi audio, tapi tidak bisa menilai segmen " +
                 "dengan LLM dan tidak bisa membuat narasi.",
+            style = MaterialTheme.typography.bodySmall
+        )
+        // v1.4.0 (P1-3): cache sumber video dibatasi 500 MB (LRU
+        // otomatis) — tombol ini menghapus file sumber yang masih
+        // tersisa. History analisa TIDAK ikut terhapus.
+        Text(
+            text = "Cache sumber video",
+            style = MaterialTheme.typography.titleMedium
+        )
+        if (viewModel.cacheInfo.isNotBlank()) {
+            Text(text = viewModel.cacheInfo, style = MaterialTheme.typography.bodyMedium)
+        }
+        OutlinedButton(
+            onClick = { viewModel.clearSourceCache() },
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Bersihkan Cache")
+        }
+        Text(
+            text = "Menghapus file video sumber yang sudah diunduh untuk " +
+                "analisa/download. Hasil analisa di History tetap ada.",
             style = MaterialTheme.typography.bodySmall
         )
     }

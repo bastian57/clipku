@@ -150,24 +150,30 @@ class GroqClient(
 
     /**
      * v1.2.0 — scoring ber-chunk PARALEL 3 model (upgrade #1 riset
-     * super-cepat). Jendela dibangun sama seperti v1.0.7 (8 segmen,
-     * langkah 7 ≈ overlap 1 segmen), tapi dieksekusi paralel:
-     * jendela dibagikan round-robin ke 3 model Groq gratis
-     * (gpt-oss-120b, gpt-oss-20b, qwen3.8-27b). Limit TPM Groq
-     * berlaku PER MODEL, bukan per akun — jadi paralel lintas model
-     * tidak melanggar batas 8.000 TPM per model. Pacing antar call
-     * ke model YANG SAMA dipertahankan: jendela ke model yang sama
-     * di-stagger WINDOW_DELAY_MS (12 detik) — jendela 0/1/2 mulai
-     * langsung, 3/4/5 setelah 12 detik, dst.
+     * super-cepat). Jendela dibangun dari startMs segmen memakai
+     * WINDOW_MS (12 menit) + overlap WINDOW_OVERLAP_MS (90 detik)
+     * — v1.4.0 (P2-1): dulu jendela dibangun dari INDEKS (8 segmen,
+     * langkah 7) sehingga konstanta WINDOW_MS/WINDOW_OVERLAP_MS
+     * tidak pernah dipakai dan "12 menit" hanya benar kalau tiap
+     * segmen persis ~90 detik. Kini jendela = segmen yang startMs-nya
+     * jatuh di [awal, awal + 12 menit), maks 8 segmen per jendela
+     * (pengaman kalau kalimat sangat rapat); jendela berikutnya
+     * mulai 10,5 menit setelah jendela sebelumnya (overlap 90 dtk
+     * = ~1 segmen, sama seperti dulu). Segmen di dua jendela
+     * di-dedupe (skor tertinggi menang). Jendela dihitung BERHASIL
+     * hanya kalau LLM benar-benar men-skor >=1 segmen (v1.0.8 P0-7).
+     * Eksekusi paralel: jendela dibagikan round-robin ke 3 model
+     * Groq gratis. Limit TPM Groq berlaku PER MODEL, bukan per
+     * akun — jadi paralel lintas model tidak melanggar batas 8.000
+     * TPM per model. Pacing antar call ke model YANG SAMA
+     * dipertahankan: jendela ke model yang sama di-stagger
+     * WINDOW_DELAY_MS (12 detik).
      * Isolasi gagal per jendela tetap berlaku (v1.0.7): satu jendela
      * gagal tidak menolkan video. Gagal di model yang ditugaskan —
      * kecuali 413 (prompt terlalu besar akan gagal di semua model
      * dengan prompt yang sama) — dicoba SEKALI ke model lain; kalau
      * itu pun gagal, jendela dicatat gagal dan segmennya tetap bisa
      * jadi clip lewat jalur transcript-only di Scoring.
-     * Segmen yang masuk dua jendela (overlap) di-dedupe: skor
-     * tertinggi yang menang. Jendela dihitung BERHASIL hanya kalau
-     * LLM benar-benar men-skor >=1 segmen (v1.0.8 P0-7).
      */
     suspend fun scoreSegmentsChunked(
         apiKey: String,
@@ -178,17 +184,19 @@ class GroqClient(
         if (segments.isEmpty()) {
             return@withContext ChunkedScoreResult(emptyMap(), 0, 0, 0, null)
         }
-        // Bangun daftar jendela dulu (8 segmen, langkah 7) — sama
-        // seperti v1.0.7, hanya eksekusinya yang paralel.
+        // v1.4.0 (P2-1): jendela BERBASIS WAKTU, bukan indeks.
+        val sorted = segments.sortedBy { it.startMs }
         val windows = mutableListOf<List<SegmentInput>>()
-        var fromIndex = 0
-        while (fromIndex < segments.size) {
-            windows.add(
-                segments.subList(fromIndex, minOf(segments.size, fromIndex + 8))
-            )
-            if (fromIndex + 8 >= segments.size) break
-            fromIndex += 7
+        var windowStartMs = sorted.first().startMs
+        val lastStartMs = sorted.maxOf { it.startMs }
+        while (windowStartMs <= lastStartMs) {
+            val windowEndMs = windowStartMs + WINDOW_MS
+            val window = sorted.filter { it.startMs in windowStartMs until windowEndMs }
+                .take(8)
+            if (window.isNotEmpty()) windows.add(window)
+            windowStartMs += WINDOW_MS - WINDOW_OVERLAP_MS
         }
+        if (windows.isEmpty()) windows.add(sorted)
         // v1.2.0 — eksekusi paralel: satu async per jendela.
         // postOnce memblokir thread (OkHttp execute), jadi tiap
         // async eksplisit di Dispatchers.IO juga.
@@ -479,6 +487,11 @@ class GroqClient(
      * (maks TOP 6), minta urutan terbaik-dulu. Gagal = null (pemanggil
      * memakai urutan semula, bukan crash). Input kecil: tiap kandidat
      * maks 1200 karakter transkrip, jadi call ini tidak bisa kena 413.
+     * v1.4.0 (P1-7): rantai model di sini DULU tanpa hygiene 413/429
+     * (callChat sudah punya sejak v1.0.8, loop ini belum): 413 kini
+     * fail-fast (prompt yang sama gagal di semua model — jangan buang
+     * token), 429 diberi jeda eksponensial singkat (2 dtk, lalu 4 dtk)
+     * sebelum model berikutnya.
      */
     suspend fun rerankClips(
         apiKey: String,
@@ -503,7 +516,7 @@ class GroqClient(
         val userPrompt = "Judul video: $videoTitle\n\nKandidat:\n$candidateText"
         // v1.3.0 (#2): strict JSON dulu per model; kalau semua model
         // menolak strict, jatuh ke callChat lama (parser lama tetap).
-        for (model in MODELS) {
+        for ((index, model) in MODELS.withIndex()) {
             val outcome = postOnceDetailed(
                 apiKey, rankingBody(model, systemPrompt, userPrompt), model
             )
@@ -511,6 +524,13 @@ class GroqClient(
             if (content != null) {
                 val parsed = parseRanking(content)
                 if (parsed != null) return@withContext parsed
+            }
+            val err = outcome.error ?: ""
+            // 413 = prompt terlalu besar di semua model — berhenti.
+            if (err.startsWith("HTTP 413")) break
+            // 429 = jeda eksponensial singkat sebelum model berikut.
+            if (err.startsWith("HTTP 429") && index < MODELS.lastIndex) {
+                delay(RETRY_429_BASE_MS * (index + 1))
             }
         }
         return@withContext try {
@@ -613,7 +633,9 @@ class GroqClient(
         val id: Int,
         val startLabel: String,
         val endLabel: String,
-        val text: String
+        val text: String,
+        /** v1.4.0 (P2-1): awal segmen (ms) — pembangun jendela berbasis waktu. */
+        val startMs: Long = 0L
     )
 
     /** Narasi final siap copas ke SuaraKu. Validasi panjang dilakukan di Narration. */
@@ -775,7 +797,11 @@ class GroqClient(
         }.replace(Regex("\\s+"), " ").trim().ifEmpty { "tanpa pesan error" }
     }
 
-    private fun parseScores(raw: String): Map<Int, SegmentScore> {
+    /**
+     * v1.4.0 (P2-9): internal supaya unit test bisa menguji parsing
+     * skor LLM tanpa network/key. Logika TIDAK berubah.
+     */
+    internal fun parseScores(raw: String): Map<Int, SegmentScore> {
         val out = mutableMapOf<Int, SegmentScore>()
         try {
             val start = raw.indexOf('{')

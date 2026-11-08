@@ -11,7 +11,12 @@ import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
+import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.MergingMediaSource
+import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import com.daftech.clipku.Prefs
 import com.daftech.clipku.analysis.AudioEnergy
 import com.daftech.clipku.analysis.GroqClient
@@ -30,7 +35,10 @@ import com.daftech.clipku.youtube.InnertubeClient
 import com.daftech.clipku.youtube.NewPipeStreamExtractor
 import com.daftech.clipku.youtube.VideoId
 import java.io.File
+import java.util.Locale
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -61,6 +69,23 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch {
             historyRepository.observeAll().collect { historyItems = it }
         }
+        // v1.4.0 (P1-11): bersihkan file temp Whisper yang tertinggal
+        // kalau app mati di tengah jalan (finally ViewModel tidak
+        // sempat jalan saat proses mati). Hanya file clipku-whisper-*
+        // di cacheDir — bukan History, bukan cache sumber.
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val cacheDir = getApplication<Application>().cacheDir
+                cacheDir.listFiles()
+                    ?.filter { it.name.startsWith("clipku-whisper-") }
+                    ?.forEach { file ->
+                        try { file.delete() } catch (e: Exception) { /* abaikan */ }
+                    }
+            } catch (e: Exception) {
+                // abaikan — pembersihan startup best-effort
+            }
+        }
+        refreshCacheInfo()
     }
 
     var link by mutableStateOf("")
@@ -81,11 +106,37 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
         private set
     var groqKey by mutableStateOf(prefs.groqApiKey)
         private set
+    /**
+     * v1.4.0 (P2-3): key yang TERAKHIR DISIMPAN (prefs). Settings
+     * menampilkan "belum disimpan" kalau groqKey != groqKeySaved.
+     */
+    var groqKeySaved by mutableStateOf(prefs.groqApiKey)
+        private set
     var lastCopied by mutableStateOf(false)
+        private set
+    /**
+     * v1.4.0 (P1-2): error playback preview terakhir (dari
+     * Player.Listener) — MainScreen menampilkannya di bawah player,
+     * supaya gagal putar tidak diam.
+     */
+    var previewError by mutableStateOf<String?>(null)
+        private set
+    /**
+     * v1.4.0 (P1-3): info ukuran cache sumber untuk Settings
+     * ("Cache sumber: 123 MB — maks 500 MB").
+     */
+    var cacheInfo by mutableStateOf("")
         private set
 
     private var currentInfo: VideoInfo? = null
     private var player: ExoPlayer? = null
+    /**
+     * v1.4.0 (P1-10): Job yang bisa dibatalkan tombol Batal —
+     * analisa (satu Job), download + narasi (per clip).
+     */
+    private var analysisJob: Job? = null
+    private val downloadJobs = mutableMapOf<Int, Job>()
+    private val narrationJobs = mutableMapOf<Int, Job>()
 
     fun updateLink(value: String) {
         link = value
@@ -130,6 +181,7 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
     fun saveGroqKey() {
         prefs.groqApiKey = groqKey.trim()
         groqKey = prefs.groqApiKey
+        groqKeySaved = prefs.groqApiKey
         status = if (groqKey.isBlank()) {
             "Groq API key dihapus. Narasi dan skor LLM tidak bisa jalan tanpa key."
         } else {
@@ -140,6 +192,7 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
     fun clearGroqKey() {
         prefs.clearGroqKey()
         groqKey = ""
+        groqKeySaved = ""
         status = "Groq API key dihapus."
     }
 
@@ -147,31 +200,88 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
         error = null
     }
 
-    /** Player preview per clip (stream langsung, tanpa mengunduh file). */
-    fun previewPlayer(context: Context, clip: Clip): ExoPlayer {
+    /**
+     * v1.4.0 (P1-2): hasil preview + apakah preview itu ber-audio.
+     * MainScreen menampilkan "preview tanpa audio" kalau hasAudio
+     * false, supaya clip adaptive yang bisu tidak dikira bisu.
+     */
+    data class PreviewResult(val player: ExoPlayer, val hasAudio: Boolean)
+
+    /**
+     * Player preview per clip (stream langsung, tanpa mengunduh file).
+     * v1.4.0 (P1-2): video adaptive (video-only + audio terpisah)
+     * kini diputar sebagai MergingMediaSource video+audio — dulu
+     * hanya track video yang diputar dan clip terdengar bisu.
+     * Kalau HANYA video-only yang tersedia (tanpa audio sama sekali),
+     * preview tetap jalan tapi hasAudio=false + label di UI. Error
+     * playback async kini masuk previewError (dulu diam).
+     */
+    fun previewPlayer(context: Context, clip: Clip): PreviewResult {
         val info = currentInfo ?: throw IllegalStateException("Analisa dulu sebelum preview.")
-        val url = info.stream.progressiveUrl
-            ?: info.stream.videoOnlyUrl
-            ?: throw IllegalStateException("Tidak ada stream untuk preview.")
+        val clipping = MediaItem.ClippingConfiguration.Builder()
+            .setStartPositionMs(clip.startMs)
+            .setEndPositionMs(clip.endMs)
+            .build()
         val existing = player
         if (existing != null) {
             existing.stop()
             existing.release()
         }
-        val clipping = MediaItem.ClippingConfiguration.Builder()
-            .setStartPositionMs(clip.startMs)
-            .setEndPositionMs(clip.endMs)
-            .build()
-        val item = MediaItem.Builder()
-            .setUri(url)
-            .setClippingConfiguration(clipping)
-            .build()
+        previewError = null
+        val progressiveUrl = info.stream.progressiveUrl
+        val videoOnlyUrl = info.stream.videoOnlyUrl
+        val audioUrl = info.stream.audioUrl
         val newPlayer = ExoPlayer.Builder(context).build()
-        newPlayer.setMediaItem(item)
+        newPlayer.addListener(object : Player.Listener {
+            override fun onPlayerError(error: PlaybackException) {
+                previewError = "Preview gagal diputar: " +
+                    (error.message?.take(120) ?: "tanpa pesan")
+            }
+        })
+        var hasAudio = false
+        when {
+            progressiveUrl != null -> {
+                // Progressive = video+audio dalam satu stream.
+                val item = MediaItem.Builder()
+                    .setUri(progressiveUrl)
+                    .setClippingConfiguration(clipping)
+                    .build()
+                newPlayer.setMediaItem(item)
+                hasAudio = true
+            }
+            videoOnlyUrl != null && audioUrl != null -> {
+                // Adaptive: gabung video + audio (MergingMediaSource),
+                // keduanya di-clip ke rentang yang sama.
+                val factory = DefaultDataSource.Factory(context)
+                val videoItem = MediaItem.Builder()
+                    .setUri(videoOnlyUrl)
+                    .setClippingConfiguration(clipping)
+                    .build()
+                val audioItem = MediaItem.Builder()
+                    .setUri(audioUrl)
+                    .setClippingConfiguration(clipping)
+                    .build()
+                val merged = MergingMediaSource(
+                    ProgressiveMediaSource.Factory(factory).createMediaSource(videoItem),
+                    ProgressiveMediaSource.Factory(factory).createMediaSource(audioItem)
+                )
+                newPlayer.setMediaSource(merged)
+                hasAudio = true
+            }
+            videoOnlyUrl != null -> {
+                val item = MediaItem.Builder()
+                    .setUri(videoOnlyUrl)
+                    .setClippingConfiguration(clipping)
+                    .build()
+                newPlayer.setMediaItem(item)
+                hasAudio = false
+            }
+            else -> throw IllegalStateException("Tidak ada stream untuk preview.")
+        }
         newPlayer.prepare()
         newPlayer.play()
         player = newPlayer
-        return newPlayer
+        return PreviewResult(newPlayer, hasAudio)
     }
 
     fun stopPreview() {
@@ -182,9 +292,103 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
             // abaikan
         }
         player = null
+        previewError = null
+    }
+
+    /**
+     * v1.4.0 (P1-10): batalkan analisa yang sedang berjalan.
+     * Coroutine dibatalkan (finally di startAnalysis mereset
+     * isAnalysing); status kembali normal, bukan menggantung.
+     * Catatan jujur: pembatalan tidak memotong request HTTP yang
+     * sedang blokir di thread IO — request itu selesai sendiri
+     * (timeout OkHttp), tapi hasilnya dibuang dan UI langsung bebas.
+     */
+    fun cancelAnalysis() {
+        analysisJob?.cancel()
+        analysisJob = null
+        isAnalysing = false
+        status = "Analisa dibatalkan."
+    }
+
+    /** v1.4.0 (P1-10): batalkan download satu clip. */
+    fun cancelDownload(clip: Clip) {
+        downloadJobs[clip.index]?.cancel()
+        downloadJobs.remove(clip.index)
+        updateClip(clip.index) { it.copy(isDownloading = false) }
+        status = "Download clip ${clip.index} dibatalkan."
+    }
+
+    /** v1.4.0 (P1-10): batalkan pembuatan narasi satu clip. */
+    fun cancelNarration(clip: Clip) {
+        narrationJobs[clip.index]?.cancel()
+        narrationJobs.remove(clip.index)
+        updateClip(clip.index) {
+            it.copy(isGeneratingNarration = false, narrationStage = null)
+        }
+        status = "Pembuatan narasi clip ${clip.index} dibatalkan."
+    }
+
+    /**
+     * v1.4.0 (P2-8): salin teks diagnostik lengkap ke clipboard —
+     * user tidak perlu screenshot untuk melapor.
+     */
+    fun copyDiagnostic() {
+        val text = diagnostic.ifBlank { return }
+        val context = getApplication<Application>()
+        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE)
+            as ClipboardManager
+        clipboard.setPrimaryClip(ClipData.newPlainText("Diagnostik ClipKu", text))
+        status = "Diagnostik tersalin ke clipboard."
+    }
+
+    /**
+     * v1.4.0 (P1-3): hitung ulang info ukuran cache sumber untuk
+     * Settings. Dipanggil di init + setelah bersih-bersih.
+     */
+    fun refreshCacheInfo() {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val bytes = ClipDownload.sourceCacheSizeBytes(getApplication())
+                val mb = bytes / (1024 * 1024)
+                val limitMb = ClipDownload.MAX_SOURCE_CACHE_BYTES / (1024 * 1024)
+                cacheInfo = "Cache sumber: $mb MB (maks $limitMb MB, file tertua " +
+                    "dihapus otomatis kalau melebihi batas)"
+            } catch (e: Exception) {
+                cacheInfo = ""
+            }
+        }
+    }
+
+    /** v1.4.0 (P1-3): hapus semua file sumber cache (bukan History). */
+    fun clearSourceCache() {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val freed = ClipDownload.clearSourceCache(getApplication())
+                val mb = freed / (1024 * 1024)
+                status = "Cache sumber dibersihkan ($mb MB dibebaskan). " +
+                    "History analisa tidak ikut terhapus."
+                refreshCacheInfo()
+            } catch (e: Exception) {
+                status = "Gagal membersihkan cache: ${e.message ?: "tanpa pesan"}"
+            }
+        }
+    }
+
+    /**
+     * Bahasa yang diharapkan dari caption (dipakai P1-4 cross-check
+     * Whisper + P1-6): "id" kalau ada caption id, kalau tidak bahasa
+     * caption pertama, null kalau tidak ada caption sama sekali.
+     */
+    private fun expectedCaptionLanguage(info: VideoInfo): String? {
+        if (info.captionTracks.any { it.languageCode.startsWith("id") }) return "id"
+        return info.captionTracks.firstOrNull()?.languageCode
+            ?.take(2)?.lowercase()?.takeIf { it.isNotBlank() }
     }
 
     override fun onCleared() {
+        analysisJob?.cancel()
+        downloadJobs.values.forEach { it.cancel() }
+        narrationJobs.values.forEach { it.cancel() }
         stopPreview()
         super.onCleared()
     }
@@ -202,7 +406,9 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
         clips = emptyList()
         currentInfo = null
         status = "Menghubungi YouTube…"
-        viewModelScope.launch {
+        // v1.4.0 (P1-10): Job disimpan supaya tombol Batal bisa
+        // membatalkannya (lihat cancelAnalysis).
+        analysisJob = viewModelScope.launch {
             try {
                 var info = innertube.fetchVideoInfo(videoId)
                 // v1.0.2: NewPipe DULUAN untuk stream (decipher signature).
@@ -224,6 +430,9 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                 val innertubeAudioUrl = info.stream.audioUrl
                 var audioUrls: List<String> = listOfNotNull(info.stream.audioUrl)
                 status = "Mencari stream via NewPipe…"
+                // v1.4.0 (P1-6): apakah bahasa track audio yang menang
+                // diketahui (locale null semua = tidak diketahui).
+                var newPipeAudioUnknown = false
                 try {
                     // v1.0.5: hint bahasa video untuk ranking audio
                     // NewPipe — "id" kalau ada caption id, kalau tidak
@@ -242,6 +451,9 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                     val newPipe = NewPipeStreamExtractor.extract(
                         videoId, preferredLanguage
                     )
+                    // v1.4.0 (P1-6): flag dari NewPipe — true kalau
+                    // track audio yang menang locale-nya null.
+                    newPipeAudioUnknown = newPipe.audioLanguageUnknown
                     if (newPipe.audioUrl != null || newPipe.videoUrl != null) {
                         info = info.copy(
                             stream = VideoStream(
@@ -295,6 +507,14 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                 currentInfo = info
                 videoTitle = info.title
                 videoAuthor = info.author
+                // v1.4.0 (P1-6): bahasa audio tidak diketahui kalau
+                // NewPipe melaporkan locale null, ATAU deskripsi
+                // Innertube diawali "?" (bahasa null). Ranking audio
+                // dalam kondisi ini memakai bahasa caption — ditulis
+                // eksplisit di diagnostik, bukan diam-diam.
+                val audioLangUnknown = newPipeAudioUnknown ||
+                    info.stream.audioTrackDescription.startsWith("?")
+                val captionLangForWarning = expectedCaptionLanguage(info)
                 status = "Mengambil transkrip…"
                 // v1.0.1: rantai fallback WEB -> TIMEDTEXT -> ANDROID.
                 // Sumbernya dicatat untuk diagnostik, bukan disembunyikan.
@@ -302,6 +522,10 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                 // subtitle NewPipe, labelnya dikoreksi menjadi NEWPIPE.
                 val transcriptResult = innertube.fetchTranscriptWithFallback(info)
                 val sentences = transcriptResult.sentences
+                // v1.4.0 (P1-8): timeout total tahap transkrip (120 dtk)
+                // — dicatat di diagnostik, bukan diam-diam "tidak ada
+                // caption" saat sebagian track belum sempat dicoba.
+                val transcriptTimedOut = innertube.lastTranscriptTimedOut
                 var transcriptSource = transcriptResult.source
                 if (subtitlesFromNewPipe && transcriptSource == "WEB") {
                     transcriptSource = "NEWPIPE"
@@ -359,6 +583,8 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                 var llmError: String? = null
                 // v1.0.7: jejak jendela scoring (chunked) untuk diagnostik.
                 var llmWindowsText = ""
+                // v1.4.0 (P2-2): jejak rerank (id tak dikenal / tie-breaker).
+                var rerankNote = ""
                 // v1.3.0 History: angka jendela disimpan juga ke Room.
                 var llmWindowsSucceeded = 0
                 var llmWindowsTotal = 0
@@ -384,7 +610,10 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                                 id = segment.id,
                                 startLabel = VideoId.formatMs(segment.startMs),
                                 endLabel = VideoId.formatMs(segment.endMs),
-                                text = segment.text.take(1200)
+                                text = segment.text.take(1200),
+                                // v1.4.0 (P2-1): jendela scoring kini
+                                // berbasis WAKTU (startMs), bukan indeks.
+                                startMs = segment.startMs
                             )
                         }
                         // v1.0.7: scoring ber-chunk — video 91 menit
@@ -450,13 +679,45 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                                 title = clip.title,
                                 reason = clip.reason,
                                 score = (clip.score * 100).toInt().coerceIn(0, 100),
-                                text = clip.transcript.take(1200)
+                                // v1.4.0 (P2-2): kandidat audio-only
+                                // (transkrip kosong) dinilai dari
+                                // judul+alasan, bukan teks kosong.
+                                text = if (clip.transcript.isNotBlank()) {
+                                    clip.transcript.take(1200)
+                                } else {
+                                    "Judul: ${clip.title}. " +
+                                        "Alasan: ${clip.reason}"
+                                }
                             )
                         }
                         val ranking = groq.rerankClips(key, info.title, candidates)
                         if (ranking != null) {
+                            // v1.4.0 (P2-2): id rerank yang tidak dikenal
+                            // (bukan kandidat) dicatat di diagnostik —
+                            // jangan diam-diam dibuang ke akhir.
+                            val knownIds = found.map { it.index }.toSet()
+                            val unknownIds = ranking
+                                .map { it.id }
+                                .filter { it !in knownIds }
+                                .distinct()
+                            if (unknownIds.isNotEmpty()) {
+                                rerankNote = " • rerank: id tak dikenal " +
+                                    unknownIds.joinToString(", ") +
+                                    " (diabaikan, bukan kandidat)"
+                            }
                             val rankById = ranking.associate { it.id to it.rank }
-                            val reranked = found.sortedBy { rankById[it.index] ?: 99 }
+                            val rerankScoreById =
+                                ranking.associate { it.id to it.score }
+                            // v1.4.0 (P2-2): skor rerank jadi tie-breaker
+                            // — rank sama (atau tanpa rank) diurutkan
+                            // dari skor rerank tertinggi, bukan asal
+                            // urutan list.
+                            val reranked = found.sortedWith(
+                                compareBy<Clip> { rankById[it.index] ?: 99 }
+                                    .thenByDescending {
+                                        rerankScoreById[it.index] ?: 0
+                                    }
+                            )
                             // Re-index 1..N sesuai urutan rerank; isi
                             // clip (waktu, judul, alasan, transkrip)
                             // tidak diubah — rerank hanya mengurutkan.
@@ -521,6 +782,26 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                     // nama), mis. "audio track: id, original".
                     "audio track: " +
                     info.stream.audioTrackDescription.ifEmpty { "-" } + " • " +
+                    // v1.4.0 (P1-6): peringatan bahasa audio tidak
+                    // diketahui (ranking memakai bahasa caption).
+                    (if (audioLangUnknown) {
+                        "PERINGATAN: bahasa audio tidak diketahui — " +
+                            "memakai bahasa caption" +
+                            (if (captionLangForWarning != null) {
+                                " ($captionLangForWarning)"
+                            } else {
+                                ""
+                            }) + " sebagai penentu ranking audio. • "
+                    } else {
+                        ""
+                    }) +
+                    // v1.4.0 (P1-8): timeout total tahap transkrip.
+                    (if (transcriptTimedOut) {
+                        "Transkrip: waktu habis (batas total 120 detik) — " +
+                            "sebagian track belum sempat dicoba. • "
+                    } else {
+                        ""
+                    }) +
                     "sumber stream: " + streamSource + " • audio HTTP: " +
                     // v1.3.0 (#4): streaming tidak punya HTTP code
                     // (MediaExtractor) — tampilkan "-" bukan 0.
@@ -540,7 +821,8 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                     (if (llmError != null) " (gagal: " + llmError + ")" else "") +
                     // v1.0.7: berapa jendela scoring yang berhasil/gagal.
                     // v1.2.0: jejak pre-filter + jendela per model.
-                    llmWindowsText + prefilterText + parallelText + zeroText
+                    // v1.4.0 (P2-2): jejak rerank (id tak dikenal).
+                    llmWindowsText + prefilterText + parallelText + rerankNote + zeroText
                 if (found.isEmpty()) {
                     // v1.0.8 P0-1: pesan penolakan dibangun dari sinyal
                     // yang BENAR-BENAR nol — bukan blanket "tidak punya
@@ -597,6 +879,13 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                             "Buat Narasi untuk transkrip clip via Whisper."
                     }
                 }
+            } catch (e: CancellationException) {
+                // v1.4.0 (P1-10): tombol Batal — reset state, status
+                // normal. BUKAN kegagalan analisa; hasil parsial
+                // (diagnostik sejauh ini) tetap disimpan.
+                status = "Analisa dibatalkan."
+                analysisJob = null
+                throw e
             } catch (e: Exception) {
                 error = e.message ?: "Analisa gagal. Coba lagi."
                 status = ""
@@ -607,6 +896,7 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                 }
             } finally {
                 isAnalysing = false
+                analysisJob = null
             }
         }
     }
@@ -617,14 +907,27 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
             error = "Analisa dulu sebelum download."
             return
         }
-        viewModelScope.launch {
+        // v1.4.0 (P1-10): Job per clip supaya tombol Batal bisa
+        // membatalkannya (lihat cancelDownload).
+        downloadJobs[clip.index] = viewModelScope.launch {
             updateClip(clip.index) { it.copy(isDownloading = true) }
+            // v1.4.0 (P1-1): waktu download diukur dari tap sampai
+            // tersimpan (detik) — ukuran jujur, bukan klaim byte.
+            val startedAtMs = System.currentTimeMillis()
             try {
                 val result = withContext(Dispatchers.IO) {
                     ClipDownload.downloadClipDetailed(getApplication(), info, clip)
                 }
+                val seconds = (System.currentTimeMillis() - startedAtMs) / 1000.0
+                // v1.4.0 (P1-1 + P2-5): durasi AKTUAL file hasil potong
+                // disimpan di clip — kartu clip menampilkannya ("58 dtk"),
+                // bukan durasi yang diminta.
                 updateClip(clip.index) {
-                    it.copy(isDownloading = false, savedPath = result.path)
+                    it.copy(
+                        isDownloading = false,
+                        savedPath = result.path,
+                        actualDurationMs = result.actualDurationMs
+                    )
                 }
                 // v1.0.6: jalur ekspor yang dipakai dicatat di
                 // diagnostik (segment vs full-download) — bukti
@@ -632,7 +935,17 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                 // v1.0.9: kalau lapis segmen gagal lalu full-download
                 // yang menyelamatkan, alasan gagal segmen ikut
                 // dicatat di diagnostik yang sama (format " • ").
+                // v1.4.0 (P1-1): durasi aktual + waktu download ikut
+                // dicatat — Transformer tidak mengekspos byte counter,
+                // jadi byte TIDAK diklaim di sini.
+                val durationText = result.actualDurationMs?.let { ms ->
+                    ", durasi ${ms / 1000} dtk"
+                } ?: ""
                 val exportNote = " • clip ${clip.index}: ${result.method}" +
+                    durationText +
+                    // Locale.US supaya desimal selalu titik (",1" di
+                    // locale Indonesia membingungkan di diagnostik).
+                    ", waktu " + String.format(Locale.US, "%.1f", seconds) + " dtk" +
                     if (result.segmentFailureReason != null) {
                         " (segmen gagal: ${result.segmentFailureReason})"
                     } else {
@@ -655,6 +968,12 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                         // abaikan
                     }
                 }
+            } catch (e: CancellationException) {
+                // v1.4.0 (P1-10): download dibatalkan — reset flag,
+                // status normal. BUKAN error.
+                updateClip(clip.index) { it.copy(isDownloading = false) }
+                status = "Download clip ${clip.index} dibatalkan."
+                throw e
             } catch (e: Exception) {
                 updateClip(clip.index) { it.copy(isDownloading = false) }
                 error = e.message ?: "Download clip gagal."
@@ -668,6 +987,8 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                 } else {
                     diagnostic + failNote
                 }
+            } finally {
+                downloadJobs.remove(clip.index)
             }
         }
     }
@@ -697,13 +1018,22 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
             }
             return
         }
-        viewModelScope.launch {
+        // v1.4.0 (P1-10): Job per clip supaya tombol Batal bisa
+        // membatalkannya (lihat cancelNarration).
+        narrationJobs[clip.index] = viewModelScope.launch {
             updateClip(clip.index) {
-                it.copy(isGeneratingNarration = true, narrationError = null)
+                it.copy(
+                    isGeneratingNarration = true,
+                    narrationError = null,
+                    // v1.4.0 (P1-11): tahap awal — status bertahap
+                    // supaya layar tidak diam saat Whisper berjalan.
+                    narrationStage = "menyiapkan…"
+                )
             }
             try {
                 val transcriptText: String
                 val transcriptSource: String
+                var narrationNote: String? = null
                 if (clip.transcript.isNotBlank()) {
                     transcriptText = clip.transcript
                     transcriptSource = "Transkrip"
@@ -712,25 +1042,110 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                         ?: throw IllegalStateException(
                             "Analisa dulu sebelum membuat narasi."
                         )
-                    val temp = withContext(Dispatchers.IO) {
-                        ClipDownload.cutClipToTemp(getApplication(), info, clip)
-                    } ?: throw IllegalStateException(
-                        "Gagal memotong clip untuk transkrip Whisper. " +
-                            "Coba download clip dulu, atau coba lagi."
-                    )
+                    // v1.4.0 (P1-11): tahap 1 — potong audio clip.
+                    // onProgress di cutClipToTemp menulis tahap
+                    // "memotong audio clip…" / "mengunduh audio clip…"
+                    // ke narrationStage via updateClip.
+                    var temp: File? = null
                     try {
-                        val whisperText = whisper.transcribe(key, temp)
+                        temp = withContext(Dispatchers.IO) {
+                            ClipDownload.cutClipToTemp(
+                                getApplication(), info, clip,
+                                onProgress = { stage ->
+                                    updateClip(clip.index) {
+                                        it.copy(narrationStage = stage)
+                                    }
+                                }
+                            )
+                        } ?: throw IllegalStateException(
+                            "Gagal memotong clip untuk transkrip Whisper. " +
+                                "Coba download clip dulu, atau coba lagi."
+                        )
+                        // v1.4.0 (P1-11): tahap 2 — transkrip.
+                        updateClip(clip.index) {
+                            it.copy(narrationStage = "mentranskrip…")
+                        }
+                        val detailed = whisper.transcribeDetailed(key, temp)
+                        var whisperText = detailed.text
                         if (whisperText.isBlank()) {
                             throw IllegalStateException(
                                 "Whisper tidak menemukan ucapan di clip " +
                                     "ini, jadi narasi tidak dibuat dari tebakan."
                             )
                         }
+                        // v1.4.0 (P1-4): cross-check bahasa Whisper
+                        // terhadap bahasa yang diharapkan (caption /
+                        // track yang dipilih). Kalau berbeda, audio
+                        // yang dipotong mungkin track dubbing yang
+                        // salah — pilih ulang track audio SEKALI dari
+                        // bahasa yang diharapkan, transkrip ulang,
+                        // dan tampilkan peringatan di kartu narasi.
+                        val expectedLang = expectedCaptionLanguage(info)
+                        val detectedLang = detailed.language
+                        if (expectedLang != null && detectedLang != null &&
+                            detectedLang != expectedLang
+                        ) {
+                            narrationNote = "Bahasa terdeteksi $detectedLang, " +
+                                "berbeda dari $expectedLang — track audio " +
+                                "dipilih ulang sekali."
+                            try {
+                                val repickUrl =
+                                    NewPipeStreamExtractor.extractAudioUrlForLanguage(
+                                        info.videoId, expectedLang
+                                    )
+                                if (repickUrl != null) {
+                                    val temp2 = withContext(Dispatchers.IO) {
+                                        ClipDownload.cutClipToTemp(
+                                            getApplication(), info, clip,
+                                            audioUrlOverride = repickUrl,
+                                            onProgress = { stage ->
+                                                updateClip(clip.index) {
+                                                    it.copy(narrationStage = stage)
+                                                }
+                                            }
+                                        )
+                                    }
+                                    if (temp2 != null) {
+                                        try {
+                                            updateClip(clip.index) {
+                                                it.copy(narrationStage = "mentranskrip…")
+                                            }
+                                            val detailed2 = whisper.transcribeDetailed(
+                                                key, temp2
+                                            )
+                                            if (detailed2.text.isNotBlank()) {
+                                                whisperText = detailed2.text
+                                                // Bahasa hasil re-pick
+                                                // dicatat apa adanya.
+                                                narrationNote =
+                                                    "Bahasa terdeteksi $detectedLang, " +
+                                                        "berbeda dari $expectedLang — " +
+                                                        "track audio dipilih ulang sekali" +
+                                                        (if (detailed2.language != null) {
+                                                            " (hasil: ${detailed2.language})"
+                                                        } else {
+                                                            ""
+                                                        }) + "."
+                                            }
+                                        } finally {
+                                            try { temp2.delete() } catch (e: Exception) { /* abaikan */ }
+                                        }
+                                    }
+                                }
+                            } catch (e: Exception) {
+                                // Re-pick gagal = pakai transkrip
+                                // pertama + peringatan tetap tampil.
+                            }
+                        }
                         transcriptText = whisperText
                         transcriptSource = "Whisper"
                     } finally {
-                        try { temp.delete() } catch (e: Exception) { /* abaikan */ }
+                        try { temp?.delete() } catch (e: Exception) { /* abaikan */ }
                     }
+                }
+                // v1.4.0 (P1-11): tahap 3 — buat narasi.
+                updateClip(clip.index) {
+                    it.copy(narrationStage = "membuat narasi…")
                 }
                 var raw = groq.generateNarration(key, videoTitle, transcriptText)
                 var cleaned = Narration.clean(raw)
@@ -750,7 +1165,9 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                         isGeneratingNarration = false,
                         narration = cleaned,
                         narrationWordCount = count,
-                        narrationSource = transcriptSource
+                        narrationSource = transcriptSource,
+                        narrationStage = null,
+                        narrationNote = narrationNote
                     )
                 }
                 // v1.3.0 History: simpan narasi ke entri History
@@ -769,13 +1186,24 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                         }
                     }
                 }
+            } catch (e: CancellationException) {
+                // v1.4.0 (P1-10): pembuatan narasi dibatalkan — reset
+                // flag + tahap, status normal. BUKAN error.
+                updateClip(clip.index) {
+                    it.copy(isGeneratingNarration = false, narrationStage = null)
+                }
+                status = "Pembuatan narasi clip ${clip.index} dibatalkan."
+                throw e
             } catch (e: Exception) {
                 updateClip(clip.index) {
                     it.copy(
                         isGeneratingNarration = false,
+                        narrationStage = null,
                         narrationError = e.message ?: "Gagal membuat narasi."
                     )
                 }
+            } finally {
+                narrationJobs.remove(clip.index)
             }
         }
     }

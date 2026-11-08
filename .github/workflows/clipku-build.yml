@@ -52,7 +52,11 @@ jobs:
           export ANDROID_SDK_ROOT="$ANDROID_HOME"
           mkdir -p "$ANDROID_HOME/cmdline-tools"
           cd /tmp
-          curl -sL -o cmdtools.zip "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
+          # v1.4.0 (P1-9): -f (gagal kalau HTTP error, bukan simpan
+          # halaman error sebagai zip) + --retry 3 + cek ukuran file
+          # sebelum unzip — flake download Gradle v1.0.5 jangan terulang.
+          curl -f -sL --retry 3 -o cmdtools.zip "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
+          test -s cmdtools.zip
           unzip -q -o cmdtools.zip -d "$ANDROID_HOME/cmdline-tools"
           mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
           export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
@@ -66,10 +70,19 @@ jobs:
         run: |
           set -e
           cd /tmp
-          curl -sL -o gradle-8.9-bin.zip "https://services.gradle.org/distributions/gradle-8.9-bin.zip"
+          # v1.4.0 (P1-9): sama seperti step SDK — -f + --retry 3 +
+          # cek ukuran sebelum unzip.
+          curl -f -sL --retry 3 -o gradle-8.9-bin.zip "https://services.gradle.org/distributions/gradle-8.9-bin.zip"
+          test -s gradle-8.9-bin.zip
           unzip -q -o gradle-8.9-bin.zip
           echo "/tmp/gradle-8.9/bin" >> "$GITHUB_PATH"
           /tmp/gradle-8.9/bin/gradle --version | head -n 5
+
+      - name: Unit test (v1.4.0 P2-9 — gagal test = build merah)
+        run: |
+          set -e
+          gradle testDebugUnitTest 2>&1 | tee test.log
+          ls app/build/test-results/testDebugUnitTest/ || true
 
       - name: Build debug APK (log ke build.log)
         run: |

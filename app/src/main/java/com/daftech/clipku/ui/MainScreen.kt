@@ -90,6 +90,15 @@ fun MainScreen(
         ) {
             Text(if (viewModel.isAnalysing) "Menganalisa…" else "Analisa")
         }
+        // v1.4.0 (P1-10): tombol Batal selama analisa berjalan.
+        if (viewModel.isAnalysing) {
+            OutlinedButton(
+                onClick = { viewModel.cancelAnalysis() },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Batal")
+            }
+        }
         // v1.3.0 History: link yang ditempel sudah pernah dianalisa —
         // tawarkan buka hasil lama (tanpa analisa ulang / tanpa
         // network) atau analisa ulang (menimpa entri lama).
@@ -131,6 +140,11 @@ fun MainScreen(
         }
         if (viewModel.diagnostic.isNotBlank()) {
             Text(text = viewModel.diagnostic, style = MaterialTheme.typography.bodySmall)
+            // v1.4.0 (P2-8): salin diagnostik lengkap ke clipboard —
+            // tidak perlu screenshot untuk melapor.
+            OutlinedButton(onClick = { viewModel.copyDiagnostic() }) {
+                Text("Salin Diagnostik")
+            }
         }
         if (viewModel.videoTitle.isNotBlank()) {
             Text(text = viewModel.videoTitle, style = MaterialTheme.typography.titleMedium)
@@ -144,8 +158,11 @@ fun MainScreen(
                 onPreview = { viewModel.previewPlayer(context, clip) },
                 onStopPreview = { viewModel.stopPreview() },
                 onDownload = { viewModel.requestDownload(clip) },
+                onCancelDownload = { viewModel.cancelDownload(clip) },
                 onGenerateNarration = { viewModel.generateNarrationFor(clip) },
-                onCopyNarration = { viewModel.copyNarration(clip) }
+                onCancelNarration = { viewModel.cancelNarration(clip) },
+                onCopyNarration = { viewModel.copyNarration(clip) },
+                previewError = viewModel.previewError
             )
         }
         if (viewModel.clips.isNotEmpty()) {
@@ -165,14 +182,19 @@ fun MainScreen(
 @Composable
 private fun ClipCard(
     clip: Clip,
-    onPreview: () -> ExoPlayer,
+    onPreview: () -> ClipKuViewModel.PreviewResult,
     onStopPreview: () -> Unit,
     onDownload: () -> Unit,
+    onCancelDownload: () -> Unit,
     onGenerateNarration: () -> Unit,
-    onCopyNarration: () -> Unit
+    onCancelNarration: () -> Unit,
+    onCopyNarration: () -> Unit,
+    previewError: String?
 ) {
     var showPlayer by remember { mutableStateOf(false) }
     var playerRef by remember { mutableStateOf<ExoPlayer?>(null) }
+    // v1.4.0 (P1-2): apakah preview yang sedang tampil ber-audio.
+    var previewHasAudio by remember { mutableStateOf(true) }
 
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -187,9 +209,13 @@ private fun ClipCard(
                 style = MaterialTheme.typography.titleMedium
             )
             // Metadata di luar teks narasi: tidak pernah ikut tersalin.
+            // v1.4.0 (P2-5): durasi AKTUAL file hasil potong (kalau
+            // sudah di-download), kalau belum — durasi yang diminta.
+            val shownDurationSec = (clip.actualDurationMs ?: clip.durationMs) / 1000
             Text(
                 text = Scoring.label(clip.startMs, clip.endMs) +
-                    " • ${clip.durationMs / 1000} detik" +
+                    " • $shownDurationSec dtk" +
+                    (if (clip.actualDurationMs != null) " (aktual)" else "") +
                     " • skor ${(clip.score * 100).toInt()}",
                 style = MaterialTheme.typography.bodySmall
             )
@@ -197,7 +223,9 @@ private fun ClipCard(
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(onClick = {
                     try {
-                        playerRef = onPreview()
+                        val result = onPreview()
+                        playerRef = result.player
+                        previewHasAudio = result.hasAudio
                         showPlayer = true
                     } catch (e: Exception) {
                         // Preview gagal (tidak ada stream): tombol Download
@@ -225,6 +253,19 @@ private fun ClipCard(
                         .fillMaxWidth()
                         .height(200.dp)
                 )
+                // v1.4.0 (P1-2): jangan diam-diam bisu — kalau hanya
+                // video-only yang tersedia, labelnya eksplisit.
+                if (!previewHasAudio) {
+                    Text(
+                        text = "Preview tanpa audio — hanya video yang " +
+                            "tersedia untuk clip ini. File download tetap " +
+                            "ber-audio kalau track audio tersedia.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+                previewError?.let { message ->
+                    Text(text = message, style = MaterialTheme.typography.bodySmall)
+                }
             }
             Button(
                 onClick = onDownload,
@@ -232,6 +273,15 @@ private fun ClipCard(
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Text(if (clip.isDownloading) "Menyimpan…" else "Download")
+            }
+            // v1.4.0 (P1-10): batalkan download clip yang sedang berjalan.
+            if (clip.isDownloading) {
+                OutlinedButton(
+                    onClick = onCancelDownload,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Batal Download")
+                }
             }
             clip.savedPath?.let { path ->
                 Text(text = "Tersimpan: $path", style = MaterialTheme.typography.bodySmall)
@@ -245,12 +295,31 @@ private fun ClipCard(
                     if (clip.isGeneratingNarration) "Membuat narasi…" else "Buat Narasi"
                 )
             }
+            // v1.4.0 (P1-10): batalkan pembuatan narasi yang sedang berjalan.
+            if (clip.isGeneratingNarration) {
+                OutlinedButton(
+                    onClick = onCancelNarration,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Batal Narasi")
+                }
+                // v1.4.0 (P1-11): tahap yang sedang berjalan — layar
+                // tidak diam saat Whisper bekerja.
+                clip.narrationStage?.let { stage ->
+                    Text(text = stage, style = MaterialTheme.typography.bodySmall)
+                }
+            }
             clip.narrationError?.let { message ->
                 Text(text = message, style = MaterialTheme.typography.bodySmall)
             }
             clip.narration?.let { narration ->
                 // BLOK NARASI FINAL — satu-satunya yang disalin tombol Salin.
                 Text(text = narration, style = MaterialTheme.typography.bodyMedium)
+                // v1.4.0 (P1-4): peringatan cross-check bahasa Whisper
+                // — tampil di bawah blok narasi (bukan bagian teks).
+                clip.narrationNote?.let { note ->
+                    Text(text = note, style = MaterialTheme.typography.bodySmall)
+                }
                 // Metadata narasi di luar blok: tidak ikut tersalin.
                 // Termasuk sumber transkrip ("Transkrip"/"Whisper") —
                 // label ini hanya info UI, bukan bagian teks yang disalin.

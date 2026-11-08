@@ -77,7 +77,25 @@ data class Clip(
     val narrationWordCount: Int = 0,
     val narrationError: String? = null,
     val isDownloading: Boolean = false,
-    val isGeneratingNarration: Boolean = false
+    val isGeneratingNarration: Boolean = false,
+    /**
+     * v1.4.0 (P2-5): durasi AKTUAL file clip hasil download (dari
+     * MediaExtractor), bukan durasi yang diminta. Null kalau belum
+     * diunduh — UI menampilkan durasi yang diminta saja.
+     */
+    val actualDurationMs: Long? = null,
+    /**
+     * v1.4.0 (P1-11): tahap narasi Whisper yang sedang berjalan
+     * ("memotong audio clip…", "mengunduh audio clip…",
+     * "mentranskrip…", "membuat narasi…"). Null kalau tidak jalan.
+     */
+    val narrationStage: String? = null,
+    /**
+     * v1.4.0 (P1-4): peringatan bahasa Whisper, mis. "bahasa
+     * terdeteksi en, berbeda dari id". Metadata UI di luar blok
+     * narasi — tidak ikut tersalin, tidak disimpan ke History.
+     */
+    val narrationNote: String? = null
 ) {
     val durationMs: Long get() = endMs - startMs
 }

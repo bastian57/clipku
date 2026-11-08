@@ -74,7 +74,14 @@ data class NewPipeStreamResult(
      * clip (tetap pakai audioUrl bitrate tertinggi). Null kalau
      * tidak ada kandidat yang lebih rendah dari audioUrl.
      */
-    val analysisAudioUrl: String? = null
+    val analysisAudioUrl: String? = null,
+    /**
+     * v1.4.0 (P1-6): true kalau track audio yang menang TIDAK punya
+     * info locale sama sekali — ranking jatuh ke tipe/nama/bitrate
+     * tanpa bukti bahasa. ViewModel menampilkan peringatan eksplisit
+     * ("bahasa audio tidak diketahui — memakai bahasa caption").
+     */
+    val audioLanguageUnknown: Boolean = false
 )
 
 object NewPipeStreamExtractor {
@@ -127,6 +134,16 @@ object NewPipeStreamExtractor {
             val audio = rankedAudio.firstOrNull()?.url
             val audioDescription = rankedAudio.firstOrNull()
                 ?.let { describeAudio(it) } ?: ""
+            // v1.4.0 (P1-6): bahasa pemenang tidak diketahui kalau
+            // locale track-nya null — ranking saat itu tidak punya
+            // bukti bahasa sama sekali (bukan "locale cocok").
+            val audioLanguageUnknown = rankedAudio.firstOrNull()?.let { stream ->
+                try {
+                    stream.audioLocale?.language == null
+                } catch (e: Exception) {
+                    true
+                }
+            } ?: true
             val video = pickVideo(
                 (extractor.videoStreams ?: emptyList()) +
                     (extractor.videoOnlyStreams ?: emptyList())
@@ -137,10 +154,51 @@ object NewPipeStreamExtractor {
                 subtitles,
                 rankedAudio.mapNotNull { it.url }.filter { it.isNotEmpty() }.distinct(),
                 audioDescription,
-                pickAnalysisAudio(rankedAudio, preferred)
+                pickAnalysisAudio(rankedAudio, preferred),
+                audioLanguageUnknown
             )
         } catch (e: Exception) {
             NewPipeStreamResult(null, null, emptyList())
+        }
+    }
+
+    /**
+     * v1.4.0 (P1-4): URL audio SATU BAHASA tertentu — dipakai
+     * ViewModel saat Whisper mendeteksi bahasa berbeda dari yang
+     * diharapkan: pilih ulang track SEKALI. Mengembalikan URL track
+     * yang locale-nya BENAR-BENAR cocok dengan [language], atau
+     * null kalau tidak ada track seperti itu (bukan track sembarang
+     * — memaksa track yang salah sama saja dengan tidak re-pick).
+     * Best-effort: gagal extract = null, bukan exception.
+     */
+    suspend fun extractAudioUrlForLanguage(
+        videoId: String,
+        language: String,
+        http: OkHttpClient = OkHttpClient.Builder()
+            .connectTimeout(20, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
+            .build()
+    ): String? = withContext(Dispatchers.IO) {
+        try {
+            synchronized(this) {
+                if (!initialised) {
+                    NewPipe.init(OkHttpNewPipeDownloader(http))
+                    initialised = true
+                }
+            }
+            val url = "https://www.youtube.com/watch?v=$videoId"
+            val extractor: StreamExtractor = ServiceList.YouTube.getStreamExtractor(url)
+            extractor.fetchPage()
+            val ranked = pickAudioStreams(extractor.audioStreams, language)
+            ranked.firstOrNull { stream ->
+                try {
+                    normaliseLang(stream.audioLocale?.language) == language
+                } catch (e: Exception) {
+                    false
+                }
+            }?.url?.takeIf { it.isNotEmpty() }
+        } catch (e: Exception) {
+            null
         }
     }
 
@@ -183,8 +241,10 @@ object NewPipeStreamExtractor {
      * Di dalam satu tingkat: format mp4 dulu, lalu bitrate tertinggi
      * (fallback lama). Semua getter NPE dibungkus try/catch — null =
      * tingkat berikutnya, bukan crash.
+     * v1.4.0 (P2-9): internal supaya unit test bisa menguji ranking
+     * langsung (bukan lewat network).
      */
-    private fun pickAudioStreams(
+    internal fun pickAudioStreams(
         streams: List<AudioStream>?,
         preferred: String
     ): List<AudioStream> {
@@ -198,7 +258,8 @@ object NewPipeStreamExtractor {
         )
     }
 
-    private fun audioRank(stream: AudioStream, preferred: String): Int {
+    /** v1.4.0 (P2-9): internal supaya unit test bisa menguji ranking langsung. */
+    internal fun audioRank(stream: AudioStream, preferred: String): Int {
         val localeLang = try {
             normaliseLang(stream.audioLocale?.language)
         } catch (e: Exception) {
@@ -264,7 +325,13 @@ object NewPipeStreamExtractor {
         0
     }
 
-    /** "id, original" / "en, dubbed" / "?, unknown" (+ nama track kalau ada). */
+    /**
+     * v1.4.0 (P1-5): label SELALU membawa sumbernya — "id, original
+     * (NewPipe)". Dulu label NewPipe dan Innertube tampil seolah
+     * setara; sekarang sumbernya eksplisit di diagnostik.
+     * "id, original" / "en, dubbed" / "?, unknown" (+ nama track
+     * kalau ada).
+     */
     private fun describeAudio(stream: AudioStream): String {
         val lang = try {
             normaliseLang(stream.audioLocale?.language)
@@ -282,9 +349,9 @@ object NewPipeStreamExtractor {
             null
         }
         return if (name != null && name.lowercase() != lang) {
-            "$lang, $type ($name)"
+            "$lang, $type ($name, NewPipe)"
         } else {
-            "$lang, $type"
+            "$lang, $type (NewPipe)"
         }
     }
 

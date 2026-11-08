@@ -286,9 +286,13 @@ object SegmentExport {
 
     /**
      * Validasi output: file ada + berisi, track yang dibutuhkan ada,
-     * durasi masuk akal (0.4x–1.6x dari yang diminta; longgar karena
-     * keyframe snap ±2 detik + edit list Transformer). Durasi yang
-     * tidak terbaca (format tanpa KEY_DURATION) tetap diterima kalau
+     * durasi masuk akal. v1.4.0 (P2-5): toleransi DIKETATKAN untuk
+     * clip 50-70 detik (target ±1 menit): 0.8x-1.2x (48-72 dtk untuk
+     * clip 60 dtk) — sebelumnya 0.4x-1.6x meloloskan clip 24-96 dtk
+     * tanpa peringatan. Di luar 50-70 dtk (mis. audio Whisper atau
+     * video pendek) tetap 0.4x-1.6x yang longgar, karena keyframe
+     * snap ±2 detik + edit list Transformer. Durasi yang tidak
+     * terbaca (format tanpa KEY_DURATION) tetap diterima kalau
      * track-nya ada — yang ditolak adalah file tanpa track / kosong.
      */
     fun validateClip(
@@ -320,8 +324,12 @@ object SegmentExport {
             if (!needVideo && !hasAudio) return false
             if (durationUs > 0) {
                 val durationMs = durationUs / 1000L
-                val minMs = (expectedDurationMs * 0.4).toLong()
-                val maxMs = (expectedDurationMs * 1.6).toLong()
+                // v1.4.0 (P2-5): 0.8x-1.2x untuk clip 50-70 detik.
+                val (lowFactor, highFactor) =
+                    if (expectedDurationMs in 50_000L..70_000L) 0.8 to 1.2
+                    else 0.4 to 1.6
+                val minMs = (expectedDurationMs * lowFactor).toLong()
+                val maxMs = (expectedDurationMs * highFactor).toLong()
                 if (durationMs < minMs || durationMs > maxMs) return false
             }
             true
