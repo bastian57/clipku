@@ -347,30 +347,39 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
      */
     fun refreshCacheInfo() {
         viewModelScope.launch(Dispatchers.IO) {
-            try {
+            // v1.4.0-fix1: hitung di IO, tapi TULIS state di Main.
+            // Menulis Compose mutableStateOf dari thread IO melempar
+            // IllegalStateException (snapshot) — ini penyebab crash
+            // "ClipKu terus berhenti" di setiap launch (init memanggil
+            // fungsi ini), terbukti dari logcat 11-08 11:45 WIB.
+            val text = try {
                 val bytes = ClipDownload.sourceCacheSizeBytes(getApplication())
                 val mb = bytes / (1024 * 1024)
                 val limitMb = ClipDownload.MAX_SOURCE_CACHE_BYTES / (1024 * 1024)
-                cacheInfo = "Cache sumber: $mb MB (maks $limitMb MB, file tertua " +
+                "Cache sumber: $mb MB (maks $limitMb MB, file tertua " +
                     "dihapus otomatis kalau melebihi batas)"
             } catch (e: Exception) {
-                cacheInfo = ""
+                ""
             }
+            withContext(Dispatchers.Main) { cacheInfo = text }
         }
     }
 
     /** v1.4.0 (P1-3): hapus semua file sumber cache (bukan History). */
     fun clearSourceCache() {
         viewModelScope.launch(Dispatchers.IO) {
-            try {
+            // v1.4.0-fix1: sama seperti refreshCacheInfo — tulis
+            // status di Main, bukan dari thread IO.
+            val text = try {
                 val freed = ClipDownload.clearSourceCache(getApplication())
                 val mb = freed / (1024 * 1024)
-                status = "Cache sumber dibersihkan ($mb MB dibebaskan). " +
+                "Cache sumber dibersihkan ($mb MB dibebaskan). " +
                     "History analisa tidak ikut terhapus."
-                refreshCacheInfo()
             } catch (e: Exception) {
-                status = "Gagal membersihkan cache: ${e.message ?: "tanpa pesan"}"
+                "Gagal membersihkan cache: ${e.message ?: "tanpa pesan"}"
             }
+            withContext(Dispatchers.Main) { status = text }
+            refreshCacheInfo()
         }
     }
 
@@ -1052,8 +1061,14 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                             ClipDownload.cutClipToTemp(
                                 getApplication(), info, clip,
                                 onProgress = { stage ->
-                                    updateClip(clip.index) {
-                                        it.copy(narrationStage = stage)
+                                    // v1.4.0-fix1: callback ini dipanggil
+                                    // dari thread IO (di dalam withContext
+                                    // di atas) — updateClip menulis Compose
+                                    // state, jadi harus lewat Main.
+                                    viewModelScope.launch {
+                                        updateClip(clip.index) {
+                                            it.copy(narrationStage = stage)
+                                        }
                                     }
                                 }
                             )
@@ -1099,8 +1114,13 @@ class ClipKuViewModel(application: Application) : AndroidViewModel(application) 
                                             getApplication(), info, clip,
                                             audioUrlOverride = repickUrl,
                                             onProgress = { stage ->
-                                                updateClip(clip.index) {
-                                                    it.copy(narrationStage = stage)
+                                                // v1.4.0-fix1: sama seperti
+                                                // di atas — callback dari
+                                                // thread IO, update lewat Main.
+                                                viewModelScope.launch {
+                                                    updateClip(clip.index) {
+                                                        it.copy(narrationStage = stage)
+                                                    }
                                                 }
                                             }
                                         )
